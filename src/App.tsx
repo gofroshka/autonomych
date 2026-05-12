@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+// Top-level shell: header + sidebar + main content + modals. All state
+// lives in `useApp()` — this component is a layout / wiring concern only.
+
+import { useState } from "react";
 import { PanelLeft, PanelRight } from "lucide-react";
-import type { ConductorState, DashboardSnapshot, EventRow, ProjectRow } from "./types";
-import { api } from "./lib/api";
+import type { ProjectRow } from "./types";
 import { Sidebar } from "./components/Sidebar";
 import { Dashboard } from "./components/Dashboard";
 import { RightPanel } from "./components/RightPanel";
@@ -14,14 +16,14 @@ import { RenameProjectModal } from "./components/RenameProjectModal";
 import { HistoryDialog } from "./components/HistoryDialog";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { Button } from "./components/ui/button";
+import { useApp } from "./state/useApp";
 
-const EVENT_BUFFER_MAX = 600;
+const TOOLTIP_DELAY_MS = 300;
 
 export function App() {
-  const [projects, setProjects] = useState<ProjectRow[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
-  const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
-  const [events, setEvents] = useState<EventRow[]>([]);
+  const app = useApp();
+  const { activeProject, state, snapshot, events, projects, activeId } = app;
+
   const [creating, setCreating] = useState(false);
   const [deletingProject, setDeletingProject] = useState<ProjectRow | null>(null);
   const [renamingProject, setRenamingProject] = useState<ProjectRow | null>(null);
@@ -29,63 +31,20 @@ export function App() {
   const [leftCollapsed, setLeftCollapsed] = useState(false);
   const [rightCollapsed, setRightCollapsed] = useState(false);
 
-  const activeProject = snapshot?.project ?? projects.find((p) => p.id === activeId) ?? null;
-  const state: ConductorState = (activeProject?.state as ConductorState) ?? "IDLE";
-
-  const refreshProjects = useCallback(async () => {
-    const list = await api.listProjects();
-    setProjects(list);
-    if (!activeId && list.length > 0) setActiveId(list[0].id);
-  }, [activeId]);
-
-  const refreshSnapshot = useCallback(async (id: string) => {
-    const snap = await api.getSnapshot(id);
-    setSnapshot(snap);
-    setEvents(snap.recent_events);
-  }, []);
-
-  useEffect(() => { refreshProjects(); }, [refreshProjects]);
-  useEffect(() => { if (activeId) refreshSnapshot(activeId); }, [activeId, refreshSnapshot]);
-
-  useEffect(() => {
-    if (!activeId) return;
-    let timer: number | null = null;
-    const scheduleRefresh = () => {
-      if (timer !== null) return;
-      timer = window.setTimeout(() => { timer = null; refreshSnapshot(activeId); }, 250);
-    };
-    const off = api.onEvent((ev) => {
-      if (ev.project_id !== activeId) return;
-      setEvents((prev) => {
-        if (prev.some((p) => p.id === ev.id)) return prev;
-        return [ev, ...prev].slice(0, EVENT_BUFFER_MAX);
-      });
-      if (["state_change", "iteration_start", "iteration_end", "agent_start", "agent_end", "agent_error", "question_asked", "question_answered"].includes(ev.type)) {
-        refreshSnapshot(activeId);
-      } else scheduleRefresh();
-    });
-    return () => { if (timer !== null) clearTimeout(timer); off(); };
-  }, [activeId, refreshSnapshot]);
-
-  const handleCreate = async (input: any) => {
-    const proj = await api.createProject(input);
-    setCreating(false);
-    await refreshProjects();
-    setActiveId(proj.id);
-  };
-  const handleStart = async () => { if (activeId) { await api.startConductor(activeId); refreshSnapshot(activeId); } };
-  const handleStartPresentation = async () => { if (activeId) { await api.startPresentationOnly(activeId); refreshSnapshot(activeId); } };
-  const handleStop = async () => { if (activeId) { await api.stopConductor(activeId); refreshSnapshot(activeId); } };
-  const handleWrapUp = async () => { if (activeId) await api.requestWrapUp(activeId); };
-  const handleResume = async (msg: string, mode: "soft" | "override") => {
-    if (activeId) { await api.resume(activeId, msg, mode); refreshSnapshot(activeId); }
-  };
+  const showPresenting = state === "PRESENTING" || state === "PREPARING_PREVIEW";
+  const firstQuestion = snapshot?.pending_questions?.[0] ?? null;
 
   return (
-    <TooltipProvider delayDuration={300}>
+    <TooltipProvider delayDuration={TOOLTIP_DELAY_MS}>
       <div className="flex flex-col h-screen overflow-hidden bg-background">
         <header className="h-12 shrink-0 flex items-center gap-3 px-3 border-b border-border bg-card/50">
-          <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setLeftCollapsed((v) => !v)} title={leftCollapsed ? "Развернуть" : "Свернуть"}>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            onClick={() => setLeftCollapsed((v) => !v)}
+            title={leftCollapsed ? "Развернуть" : "Свернуть"}
+          >
             <PanelLeft className="h-3.5 w-3.5" />
           </Button>
           <div className="flex items-center gap-2">
@@ -95,76 +54,96 @@ export function App() {
           <StateBadge state={state} />
           <div className="flex-1" />
           {activeProject && (
-            <span className="text-[11px] text-muted-foreground font-mono truncate max-w-[420px]">{activeProject.root_path}</span>
+            <span className="text-[11px] text-muted-foreground font-mono truncate max-w-[420px]">
+              {activeProject.root_path}
+            </span>
           )}
-          <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setRightCollapsed((v) => !v)} title={rightCollapsed ? "Развернуть" : "Свернуть"}>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            onClick={() => setRightCollapsed((v) => !v)}
+            title={rightCollapsed ? "Развернуть" : "Свернуть"}
+          >
             <PanelRight className="h-3.5 w-3.5" />
           </Button>
         </header>
+
         <main className="flex-1 flex min-h-0">
           {!leftCollapsed && (
             <Sidebar
               projects={projects}
               activeId={activeId}
-              onSelect={setActiveId}
+              onSelect={app.setActiveId}
               onNew={() => setCreating(true)}
               onDelete={setDeletingProject}
               onRename={setRenamingProject}
             />
           )}
+
           <section className="relative flex-1 flex flex-col min-w-0">
             <Dashboard
               project={activeProject}
               snapshot={snapshot}
-              onStart={handleStart}
-              onStartPresentation={handleStartPresentation}
-              onStop={handleStop}
-              onWrapUp={handleWrapUp}
+              onStart={app.start}
+              onStartPresentation={app.startPresentation}
+              onStop={app.stop}
+              onWrapUp={app.wrapUp}
               onEditProject={() => activeProject && setRenamingProject(activeProject)}
               onShowHistory={() => setShowHistory(true)}
             />
-            {(state === "PRESENTING" || state === "PREPARING_PREVIEW") && activeProject && (
-              <PresentingOverlay project={activeProject} snapshot={snapshot} onResume={handleResume} />
+            {showPresenting && activeProject && (
+              <PresentingOverlay
+                project={activeProject}
+                snapshot={snapshot}
+                onResume={app.resume}
+              />
             )}
           </section>
+
           {!rightCollapsed && <RightPanel events={events} project={activeProject} />}
         </main>
-        {creating && <CreateProjectModal onClose={() => setCreating(false)} onCreate={handleCreate} />}
+
+        {creating && (
+          <CreateProjectModal
+            onClose={() => setCreating(false)}
+            onCreate={async (input) => {
+              await app.createProject(input);
+              setCreating(false);
+            }}
+          />
+        )}
+
         {deletingProject && (
           <DeleteProjectModal
             project={deletingProject}
             onClose={() => setDeletingProject(null)}
             onConfirm={async (deleteFiles) => {
-              const id = deletingProject.id;
-              await api.deleteProject(id, deleteFiles);
+              await app.deleteProject(deletingProject.id, deleteFiles);
               setDeletingProject(null);
-              if (activeId === id) { setActiveId(null); setSnapshot(null); setEvents([]); }
-              await refreshProjects();
             }}
           />
         )}
+
         {renamingProject && (
           <RenameProjectModal
             project={renamingProject}
             onClose={() => setRenamingProject(null)}
             onSave={async (name, idea) => {
-              await api.renameProject(renamingProject.id, name, idea);
-              await refreshProjects();
-              if (renamingProject.id === activeId) await refreshSnapshot(renamingProject.id);
+              await app.renameProject(renamingProject.id, name, idea);
             }}
           />
         )}
+
         {showHistory && activeProject && (
           <HistoryDialog project={activeProject} onClose={() => setShowHistory(false)} />
         )}
-        {snapshot?.pending_questions && snapshot.pending_questions.length > 0 && (
+
+        {firstQuestion && (
           <QuestionModal
-            key={snapshot.pending_questions[0].id}
-            question={snapshot.pending_questions[0]}
-            onAnswer={async (answer) => {
-              await api.answerQuestion(snapshot.pending_questions[0].id, answer);
-              if (activeId) await refreshSnapshot(activeId);
-            }}
+            key={firstQuestion.id}
+            question={firstQuestion}
+            onAnswer={(answer) => app.answerQuestion(firstQuestion.id, answer)}
           />
         )}
       </div>

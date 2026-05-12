@@ -2,6 +2,7 @@
 
 use crate::conductor::Conductor;
 use crate::error::{AppError, AppResult};
+use crate::events::EventBus;
 use crate::store::Store;
 use crate::types::*;
 use std::collections::HashMap;
@@ -12,11 +13,12 @@ use tokio::sync::Mutex;
 
 pub struct AppState {
     pub store: Arc<Store>,
+    pub bus: Arc<dyn EventBus>,
     pub conductors: Mutex<HashMap<String, Arc<Conductor>>>,
 }
 
 impl AppState {
-    async fn get_or_create(&self, project_id: &str, app: &AppHandle) -> AppResult<Arc<Conductor>> {
+    async fn get_or_create(&self, project_id: &str) -> AppResult<Arc<Conductor>> {
         let mut g = self.conductors.lock().await;
         if let Some(c) = g.get(project_id) {
             return Ok(c.clone());
@@ -25,7 +27,11 @@ impl AppState {
             .store
             .get_project(project_id)
             .ok_or_else(|| AppError::ProjectNotFound(project_id.to_string()))?;
-        let c = Arc::new(Conductor::new(project, self.store.clone(), app.clone()));
+        let c = Arc::new(Conductor::new(
+            project,
+            self.store.clone(),
+            self.bus.clone(),
+        ));
         g.insert(project_id.to_string(), c.clone());
         Ok(c)
     }
@@ -109,17 +115,10 @@ pub async fn get_snapshot(
     let preview = {
         let g = state.conductors.lock().await;
         if let Some(c) = g.get(&project_id) {
-            c.preview.lock().await.status().await
+            c.preview.lock().await.status()
         } else {
             PreviewStatus {
-                running: false,
-                pid: None,
-                url: None,
-                command: None,
-                setup_steps: vec![],
-                notes: String::new(),
-                errors: vec![],
-                logs_tail: String::new(),
+                instructions: None,
                 prepared_at: None,
                 prep_error: None,
             }
@@ -148,20 +147,18 @@ pub async fn get_events(
 #[tauri::command]
 pub async fn start_conductor(
     state: State<'_, AppState>,
-    app: AppHandle,
     project_id: String,
 ) -> AppResult<()> {
-    let c = state.get_or_create(&project_id, &app).await?;
+    let c = state.get_or_create(&project_id).await?;
     c.start().await
 }
 
 #[tauri::command]
 pub async fn start_presentation_only(
     state: State<'_, AppState>,
-    app: AppHandle,
     project_id: String,
 ) -> AppResult<()> {
-    let c = state.get_or_create(&project_id, &app).await?;
+    let c = state.get_or_create(&project_id).await?;
     c.start_presentation_only().await
 }
 
@@ -172,7 +169,6 @@ pub async fn stop_conductor(
 ) -> AppResult<()> {
     if let Some(c) = state.conductors.lock().await.get(&project_id).cloned() {
         c.stop().await?;
-        c.preview.lock().await.fallback_kill().await;
     }
     Ok(())
 }
@@ -204,35 +200,31 @@ pub async fn resume(
         let _ = state.store.push_steering(&project_id, trimmed, m);
     }
     if let Some(c) = state.conductors.lock().await.get(&project_id).cloned() {
-        c.preview.lock().await.fallback_kill().await;
         c.resume().await;
     }
     Ok(())
 }
 
 #[tauri::command]
-pub async fn stop_preview(
-    state: State<'_, AppState>,
-    project_id: String,
-) -> AppResult<()> {
-    if let Some(c) = state.conductors.lock().await.get(&project_id).cloned() {
-        c.preview.lock().await.fallback_kill().await;
-    }
+pub async fn stop_preview(_state: State<'_, AppState>, _project_id: String) -> AppResult<()> {
+    // No-op in the agent-driven preview model: stopping the demo is what the
+    // shutdown agent does, which fires when the user presses "Продолжаем" or
+    // when the conductor is fully stopped. Kept as a callable command so the
+    // frontend's existing call sites compile.
     Ok(())
 }
 
 #[tauri::command]
 pub async fn retry_preview(
     state: State<'_, AppState>,
-    app: AppHandle,
     project_id: String,
 ) -> AppResult<()> {
-    let c = state.get_or_create(&project_id, &app).await?;
-    c.preview.lock().await.fallback_kill().await;
+    let c = state.get_or_create(&project_id).await?;
     let me = c.clone();
     tokio::spawn(async move {
-        // Call private prep via a public wrapper — we re-expose start_presentation_only
-        // which handles the case "no resumable iteration" → just preview.
+        // start_presentation_only handles the "no resumable iteration" case
+        // → just re-invokes preview prep. The launch agent is told to clean
+        // up any prior server on the same port.
         let _ = me.start_presentation_only().await;
     });
     Ok(())

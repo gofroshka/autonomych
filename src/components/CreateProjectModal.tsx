@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { ChevronDown, FolderOpen } from "lucide-react";
 import { api } from "../lib/api";
+import type { CreateProjectInput, PermissionMode } from "../types";
 import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "./ui/dialog";
 import { Input, Label, Textarea } from "./ui/input";
@@ -8,21 +9,26 @@ import { cn } from "../lib/cn";
 
 interface Props {
   onClose: () => void;
-  onCreate: (input: {
-    name: string; idea: string; root_path: string;
-    model_pm: string; model_specialist: string;
-    permission_mode: "default" | "acceptEdits" | "bypassPermissions";
-  }) => void;
+  onCreate: (input: CreateProjectInput) => void;
 }
+
+/** CLI-resolved aliases — always point to the latest model in each family.
+ *  No version pinning, no maintenance burden on us when Anthropic ships
+ *  a new revision. */
+const MODELS: ReadonlyArray<{ id: string; label: string; hint: string }> = [
+  { id: "opus", label: "Opus", hint: "самая умная и дорогая" },
+  { id: "sonnet", label: "Sonnet", hint: "баланс цена/качество" },
+  { id: "haiku", label: "Haiku", hint: "быстрая и дешёвая" },
+];
 
 export function CreateProjectModal({ onClose, onCreate }: Props) {
   const [name, setName] = useState("");
   const [idea, setIdea] = useState("");
   const [rootPath, setRootPath] = useState("");
   const [advanced, setAdvanced] = useState(false);
-  const [modelPm, setModelPm] = useState("claude-opus-4-5");
-  const [modelSpec, setModelSpec] = useState("claude-sonnet-4-5");
-  const [permMode, setPermMode] = useState<"default" | "acceptEdits" | "bypassPermissions">("bypassPermissions");
+  const [modelPm, setModelPm] = useState("opus");
+  const [modelSpec, setModelSpec] = useState("sonnet");
+  const [permMode, setPermMode] = useState<PermissionMode>("bypassPermissions");
 
   const pickDir = async () => {
     const p = await api.pickDirectory();
@@ -61,24 +67,18 @@ export function CreateProjectModal({ onClose, onCreate }: Props) {
           </button>
           {advanced && (
             <div className="space-y-4 border-l-2 border-border pl-4 ml-1">
-              <div className="space-y-1.5">
-                <Label>Модель для PM-агентов</Label>
-                <select value={modelPm} onChange={(e) => setModelPm(e.target.value)}
-                  className="w-full h-9 rounded-md border border-border bg-background px-3 text-sm">
-                  <option value="claude-opus-4-5">claude-opus-4-5</option>
-                  <option value="claude-sonnet-4-5">claude-sonnet-4-5</option>
-                  <option value="claude-haiku-4-5">claude-haiku-4-5</option>
-                </select>
-              </div>
-              <div className="space-y-1.5">
-                <Label>Модель для специалистов</Label>
-                <select value={modelSpec} onChange={(e) => setModelSpec(e.target.value)}
-                  className="w-full h-9 rounded-md border border-border bg-background px-3 text-sm">
-                  <option value="claude-sonnet-4-5">claude-sonnet-4-5</option>
-                  <option value="claude-opus-4-5">claude-opus-4-5</option>
-                  <option value="claude-haiku-4-5">claude-haiku-4-5</option>
-                </select>
-              </div>
+              <ModelSelect
+                label="Модель для PM-агентов"
+                hint="PO, Architect, Reviewer, Overseer"
+                value={modelPm}
+                onChange={setModelPm}
+              />
+              <ModelSelect
+                label="Модель для специалистов"
+                hint="Backend / Frontend / DevOps / Presenter / Documenter / Merge Resolver"
+                value={modelSpec}
+                onChange={setModelSpec}
+              />
               <div className="space-y-1.5">
                 <Label>Permission mode</Label>
                 <select value={permMode} onChange={(e) => setPermMode(e.target.value as typeof permMode)}
@@ -103,5 +103,34 @@ export function CreateProjectModal({ onClose, onCreate }: Props) {
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  );
+}
+
+function ModelSelect({
+  label,
+  hint,
+  value,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label>{label}</Label>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full h-9 rounded-md border border-border bg-background px-3 text-sm"
+      >
+        {MODELS.map((m) => (
+          <option key={m.id} value={m.id}>
+            {m.label} — {m.hint}
+          </option>
+        ))}
+      </select>
+    </div>
   );
 }

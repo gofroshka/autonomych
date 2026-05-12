@@ -8,16 +8,24 @@ use tokio::fs;
 use tokio::process::Command;
 
 async fn git(cwd: &Path, args: &[&str]) -> AppResult<String> {
+    let started = std::time::Instant::now();
+    let cmdline = args.join(" ");
+    tracing::trace!(cwd = %cwd.display(), cmd = %cmdline, "git: invoking");
     let out = Command::new("git")
         .args(args)
         .current_dir(cwd)
         .output()
         .await
         .map_err(|e| AppError::Git(format!("spawn git: {e}")))?;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if elapsed_ms > 5000 {
+        tracing::warn!(cmd = %cmdline, elapsed_ms, "git: slow invocation");
+    } else {
+        tracing::trace!(cmd = %cmdline, elapsed_ms, "git: done");
+    }
     if !out.status.success() {
         return Err(AppError::Git(format!(
-            "git {} failed: {}",
-            args.join(" "),
+            "git {cmdline} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         )));
     }
@@ -39,7 +47,9 @@ pub async fn ensure_repo(root: &Path, name: &str, idea: &str) -> AppResult<()> {
     .await?;
     fs::write(
         root.join(".gitignore"),
-        "node_modules/\ndist/\nbuild/\n.env\n.env.local\n*.log\n.DS_Store\n",
+        "node_modules/\ndist/\nbuild/\n.env\n.env.local\n*.log\n.DS_Store\n\
+         # Autonomych internal state (worktrees, preview manifest, logs)\n\
+         .autonomych/\n",
     )
     .await?;
     git(root, &["add", "."]).await?;
@@ -81,44 +91,162 @@ pub async fn commit_all(worktree: &Path, message: &str) -> AppResult<bool> {
 #[derive(Debug)]
 pub struct MergeResult {
     pub ok: bool,
-    pub conflict: bool,
     pub message: String,
 }
 
-pub async fn merge_branch(root: &Path, branch: &str) -> MergeResult {
+/// Outcome of trying to rebase a feature branch onto a target.
+#[derive(Debug)]
+pub enum RebaseOutcome {
+    /// Rebase finished cleanly — the working tree is at the new HEAD with
+    /// all commits replayed.
+    Clean,
+    /// Rebase is paused on a conflict. `files` holds the list of files
+    /// with conflict markers. The caller must either resolve and
+    /// `git rebase --continue`, or `git rebase --abort`.
+    Conflict { files: Vec<String> },
+    /// Catastrophic git failure (couldn't even start the rebase).
+    Error(String),
+}
+
+/// Rebase the worktree's current branch onto `target`. Stays in the worktree
+/// so a Merge Resolver agent invoked afterward sees the rebase-in-progress
+/// state.
+pub async fn rebase_onto(worktree: &Path, target: &str) -> RebaseOutcome {
+    let out = match Command::new("git")
+        .args(["rebase", target])
+        .current_dir(worktree)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return RebaseOutcome::Error(format!("spawn git rebase: {e}")),
+    };
+    if out.status.success() {
+        return RebaseOutcome::Clean;
+    }
+    // Rebase paused — most likely a conflict. Inspect for unmerged paths.
+    let files = unmerged_files(worktree).await;
+    if !files.is_empty() {
+        return RebaseOutcome::Conflict { files };
+    }
+    // Rebase failed but no conflict markers — something else (e.g. dirty
+    // worktree, bad ref). Surface the stderr verbatim.
+    let msg = format!(
+        "rebase {target} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    RebaseOutcome::Error(msg)
+}
+
+/// `git diff --name-only --diff-filter=U` — files with unresolved conflict
+/// markers. Stable across git versions.
+pub async fn unmerged_files(worktree: &Path) -> Vec<String> {
     let out = Command::new("git")
-        .args(["merge", "--no-ff", "--no-edit", branch])
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .current_dir(worktree)
+        .output()
+        .await;
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Is git currently paused mid-rebase in this worktree? Detected by the
+/// presence of `.git/rebase-merge` or `.git/rebase-apply` directories that
+/// git creates while a rebase is in flight.
+pub async fn is_rebase_in_progress(worktree: &Path) -> bool {
+    // In a worktree, `.git` is a file pointing to the real gitdir; resolve it
+    // via `git rev-parse --git-dir` which works in either layout.
+    let out = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(worktree)
+        .output()
+        .await;
+    let Ok(out) = out else { return false };
+    if !out.status.success() {
+        return false;
+    }
+    let gitdir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let gitdir = if PathBuf::from(&gitdir).is_absolute() {
+        PathBuf::from(gitdir)
+    } else {
+        worktree.join(gitdir)
+    };
+    gitdir.join("rebase-merge").exists() || gitdir.join("rebase-apply").exists()
+}
+
+/// Best-effort `git rebase --abort` for a worktree that's stuck mid-rebase.
+pub async fn rebase_abort(worktree: &Path) {
+    let _ = Command::new("git")
+        .args(["rebase", "--abort"])
+        .current_dir(worktree)
+        .output()
+        .await;
+}
+
+/// Fast-forward merge of `branch` into the root worktree's main. Used after
+/// the branch has been rebased onto main — the merge is then a trivial
+/// pointer advance with no possibility of conflict.
+pub async fn ff_merge(root: &Path, branch: &str) -> MergeResult {
+    let out = Command::new("git")
+        .args(["merge", "--ff-only", branch])
         .current_dir(root)
         .output()
         .await;
     match out {
         Ok(o) if o.status.success() => MergeResult {
             ok: true,
-            conflict: false,
             message: String::from_utf8_lossy(&o.stdout).to_string(),
         },
-        Ok(o) => {
-            let msg = format!(
-                "{}{}",
+        Ok(o) => MergeResult {
+            ok: false,
+            message: format!(
+                "ff merge of {branch} refused: {}{}",
                 String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr),
-            );
-            let conflict = msg.contains("CONFLICT");
-            if conflict {
-                let _ = Command::new("git")
-                    .args(["merge", "--abort"])
-                    .current_dir(root)
-                    .output()
-                    .await;
-            }
-            MergeResult { ok: false, conflict, message: msg }
-        }
+                String::from_utf8_lossy(&o.stderr)
+            ),
+        },
         Err(e) => MergeResult {
             ok: false,
-            conflict: false,
             message: format!("spawn git: {e}"),
         },
     }
+}
+
+/// Best-effort: bring the main worktree into a clean state before merging.
+///
+/// Aborts any in-progress merge state (e.g. left over from a previous
+/// concurrent attempt) and discards uncommitted working-tree changes that
+/// would otherwise make `git merge` refuse with "your local changes would
+/// be overwritten by merge". Callers must already hold the merge mutex.
+pub async fn cleanup_for_merge(root: &Path) {
+    // If a merge is mid-flight (.git/MERGE_HEAD present), abort it. Ignored
+    // if there's nothing to abort.
+    let _ = Command::new("git")
+        .args(["merge", "--abort"])
+        .current_dir(root)
+        .output()
+        .await;
+
+    // Wipe any uncommitted changes in the working tree. The only legitimate
+    // writer of `root` is specialist merges (which we just serialized) —
+    // anything dangling here is fallout from a previous failed merge.
+    let _ = Command::new("git")
+        .args(["reset", "--hard", "HEAD"])
+        .current_dir(root)
+        .output()
+        .await;
+    let _ = Command::new("git")
+        .args(["clean", "-fd"])
+        .current_dir(root)
+        .output()
+        .await;
 }
 
 pub async fn tag(root: &Path, name: &str) -> AppResult<()> {

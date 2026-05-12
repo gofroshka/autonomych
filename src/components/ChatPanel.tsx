@@ -25,8 +25,23 @@ export function ChatPanel({ project }: { project: ProjectRow }) {
   const send = async () => {
     const trimmed = text.trim();
     if (!trimmed || sending) return;
-    setText(""); setSending(true);
-    setMessages((prev) => [...prev, { id: `pending-${Date.now()}`, project_id: project.id, role: "user", text: trimmed, ts: Date.now(), error: null }]);
+    setText("");
+    setSending(true);
+    const pendingId =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? `pending-${crypto.randomUUID()}`
+        : `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: pendingId,
+        project_id: project.id,
+        role: "user",
+        text: trimmed,
+        ts: Date.now(),
+        error: null,
+      },
+    ]);
     try {
       await api.sendChatMessage(project.id, trimmed);
       await refresh();

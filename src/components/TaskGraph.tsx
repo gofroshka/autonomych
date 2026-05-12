@@ -1,4 +1,4 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ReactFlow, Background, BackgroundVariant, Controls, MiniMap, Position, Handle,
   useNodesState, useEdgesState, type Node, type Edge, type NodeProps,
@@ -8,6 +8,9 @@ import { Boxes, Cpu, Monitor, Server, type LucideIcon } from "lucide-react";
 import type { TaskRow } from "../types";
 import { cn } from "../lib/cn";
 import { formatDuration } from "../lib/format";
+
+/** How often to re-render the live elapsed timer for in-progress tasks. */
+const TICK_MS = 1000;
 
 const ROLE_META: Record<string, { label: string; icon: LucideIcon; color: string }> = {
   specialist_backend: { label: "Backend", icon: Server, color: "text-info" },
@@ -35,15 +38,44 @@ const ROLE_ORDER: Record<string, number> = {
   specialist_devops: 0, specialist_backend: 1, specialist_frontend: 2,
 };
 
-interface TaskNodeData extends Record<string, unknown> { task: TaskRow }
+interface TaskNodeData extends Record<string, unknown> {
+  task: TaskRow;
+  /** Cached "now" timestamp used by in-progress nodes for the live timer.
+   *  Threaded via node data so we can update it without rebuilding the layout. */
+  now: number;
+}
 type TaskNode = Node<TaskNodeData, "task">;
+
+/**
+ * Returns elapsed milliseconds for a task, or null if not yet applicable.
+ *
+ * - `in_progress`: from `started_at` (fallback to `created_at`) until `now`.
+ * - terminal states (`done`/`failed`/`skipped`): from `started_at` until `ended_at`.
+ * - everything else (`pending`): null — nothing to time yet.
+ */
+function elapsedFor(task: TaskRow, now: number): number | null {
+  const start = task.started_at ?? task.created_at;
+  if (task.status === "in_progress") {
+    return Math.max(0, now - start);
+  }
+  if (
+    task.ended_at &&
+    (task.status === "done" || task.status === "failed" || task.status === "skipped")
+  ) {
+    return Math.max(0, task.ended_at - start);
+  }
+  return null;
+}
 
 function computeLevels(tasks: TaskRow[]): Map<string, number> {
   const byArchId = new Map<string, TaskRow>();
   for (const t of tasks) if (t.architect_id) byArchId.set(t.architect_id, t);
   const levels = new Map<string, number>();
   const visit = (t: TaskRow, stack: Set<string>): number => {
-    if (levels.has(t.id)) return levels.get(t.id)!;
+    const cached = levels.get(t.id);
+    if (cached !== undefined) return cached;
+    // Cycle guard: any task that re-enters its own subgraph is treated as
+    // level 0 so we don't recurse forever.
     if (stack.has(t.id)) return 0;
     stack.add(t.id);
     let max = 0;
@@ -59,7 +91,10 @@ function computeLevels(tasks: TaskRow[]): Map<string, number> {
   return levels;
 }
 
-function buildLayout(tasks: TaskRow[]): { nodes: TaskNode[]; edges: Edge[] } {
+function buildLayout(
+  tasks: TaskRow[],
+  now: number
+): { nodes: TaskNode[]; edges: Edge[] } {
   if (tasks.length === 0) return { nodes: [], edges: [] };
   const byArchId = new Map<string, TaskRow>();
   for (const t of tasks) if (t.architect_id) byArchId.set(t.architect_id, t);
@@ -85,7 +120,7 @@ function buildLayout(tasks: TaskRow[]): { nodes: TaskNode[]; edges: Edge[] } {
       id: t.id,
       type: "task",
       position: { x: lvl * COLUMN_WIDTH, y: idx * ROW_HEIGHT },
-      data: { task: t },
+      data: { task: t, now },
       sourcePosition: Position.Right,
       targetPosition: Position.Left,
     };
@@ -117,9 +152,10 @@ function buildLayout(tasks: TaskRow[]): { nodes: TaskNode[]; edges: Edge[] } {
 function TaskFlowNode({ data }: NodeProps<TaskNode>) {
   const task = data.task;
   const cls = STATUS_STYLE[task.status] ?? STATUS_STYLE.pending;
-  const ms = task.ended_at && task.created_at ? task.ended_at - task.created_at : null;
+  const ms = elapsedFor(task, data.now);
   const meta = ROLE_META[task.role] ?? { label: task.role, icon: Cpu, color: "text-muted-foreground" };
   const RoleIcon = meta.icon;
+  const isRunning = task.status === "in_progress";
   return (
     <div
       className={cn(
@@ -144,7 +180,17 @@ function TaskFlowNode({ data }: NodeProps<TaskNode>) {
       </div>
       <div className="flex items-center justify-between text-[10px] text-muted-foreground/80 font-mono">
         <span>{STATUS_LABEL[task.status] ?? task.status}</span>
-        {ms !== null && task.status === "done" && <span>{formatDuration(ms)}</span>}
+        {ms !== null && (
+          <span
+            className={cn(
+              "tabular-nums",
+              isRunning && "text-primary"
+            )}
+            title={isRunning ? "Идёт прямо сейчас" : undefined}
+          >
+            {formatDuration(ms)}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -162,12 +208,29 @@ function StatusDot({ status }: { status: TaskRow["status"] }) {
 const nodeTypes = { task: TaskFlowNode };
 
 export function TaskGraph({ tasks }: { tasks: TaskRow[] }) {
-  const initial = useMemo(() => buildLayout(tasks), [tasks.length === 0]);
+  // Live wall clock for the in-progress elapsed-time display. Ticks only when
+  // at least one task is actually running, so an idle graph is render-quiet.
+  const [now, setNow] = useState(() => Date.now());
+  const hasRunning = useMemo(
+    () => tasks.some((t) => t.status === "in_progress"),
+    [tasks]
+  );
+
+  // Re-layout only when the graph goes from empty to non-empty (or vice
+  // versa). buildLayout is otherwise driven by status / structural changes
+  // pushed in below.
+  const initial = useMemo(
+    () => buildLayout(tasks, now),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [tasks.length === 0]
+  );
   const [nodes, setNodes, onNodesChange] = useNodesState<TaskNode>(initial.nodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initial.edges);
 
+  // Patch node data + edges when the task list changes (status, new nodes,
+  // dependencies). Positions are preserved from the user's drag state.
   useEffect(() => {
-    const fresh = buildLayout(tasks);
+    const fresh = buildLayout(tasks, now);
     setNodes((current) => {
       const byId = new Map(current.map((n) => [n.id, n]));
       return fresh.nodes.map((n) => {
@@ -176,7 +239,24 @@ export function TaskGraph({ tasks }: { tasks: TaskRow[] }) {
       });
     });
     setEdges(fresh.edges);
+    // `now` is intentionally not a dep here — it has its own effect below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tasks, setNodes, setEdges]);
+
+  // Cheap timer-only update: refresh just the `now` field in each node's
+  // data. No relayout, no re-deriving edges.
+  useEffect(() => {
+    setNodes((current) =>
+      current.map((n) => ({ ...n, data: { ...n.data, now } }))
+    );
+  }, [now, setNodes]);
+
+  // Drive the tick only while something is running.
+  useEffect(() => {
+    if (!hasRunning) return;
+    const id = window.setInterval(() => setNow(Date.now()), TICK_MS);
+    return () => window.clearInterval(id);
+  }, [hasRunning]);
 
   if (tasks.length === 0) {
     return (
