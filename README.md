@@ -27,8 +27,8 @@
 Дальше:
 
 ```bash
-git clone <repo> autonomych-rust
-cd autonomych-rust
+git clone https://github.com/gofroshka/autonomych.git
+cd autonomych
 npm install
 npm run tauri:dev
 ```
@@ -65,4 +65,4 @@ npm run tauri:dev
 
 ## Если зашло
 
-Жми звезду — мне приятно, тебе бесплатно. Issues и PR-ы тоже welcome, особенно если поднимешь на Linux или поймаешь воспроизводимый баг.
+Жми [звезду](https://github.com/gofroshka/autonomych) — мне приятно, тебе бесплатно. [Issues](https://github.com/gofroshka/autonomych/issues) и PR-ы тоже welcome, особенно если поднимешь на Linux или поймаешь воспроизводимый баг.
