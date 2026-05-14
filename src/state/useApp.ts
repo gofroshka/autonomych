@@ -8,7 +8,7 @@
 // component.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "../lib/api";
+import { api, type UpdateProjectSettingsInput } from "../lib/api";
 import { isStructural } from "../lib/events";
 import type {
   ConductorState,
@@ -41,6 +41,7 @@ export interface AppState {
   createProject: (input: CreateProjectInput) => Promise<ProjectRow>;
   deleteProject: (id: string, deleteFiles: boolean) => Promise<void>;
   renameProject: (id: string, name: string, idea: string) => Promise<void>;
+  updateProjectSettings: (id: string, s: UpdateProjectSettingsInput) => Promise<void>;
 
   // Conductor actions (no-op when no active project)
   start: () => Promise<void>;
@@ -147,6 +148,15 @@ export function useApp(): AppState {
     [activeId, refreshProjects, refreshSnapshot]
   );
 
+  const updateProjectSettings = useCallback(
+    async (id: string, s: UpdateProjectSettingsInput) => {
+      await api.updateProjectSettings(id, s);
+      await refreshProjects();
+      if (id === activeId) await refreshSnapshot(id);
+    },
+    [activeId, refreshProjects, refreshSnapshot]
+  );
+
   // ---- Conductor actions ----
   const withActive = useCallback(
     async (fn: (id: string) => Promise<void>) => {
@@ -157,7 +167,16 @@ export function useApp(): AppState {
     [activeId, refreshSnapshot]
   );
 
-  const start = useCallback(() => withActive(api.startConductor), [withActive]);
+  /**
+   * Begin (or resume) the cycle on the active project. User-side feedback
+   * goes through the backlog now, not through a pre-Start steering arg —
+   * see Dashboard's `+ В беклог` form, BacklogPanel, and PresentingOverlay.
+   */
+  const start = useCallback(async () => {
+    if (!activeId) return;
+    await api.startConductor(activeId);
+    await refreshSnapshot(activeId);
+  }, [activeId, refreshSnapshot]);
   const startPresentation = useCallback(
     () => withActive(api.startPresentationOnly),
     [withActive]
@@ -195,6 +214,7 @@ export function useApp(): AppState {
     createProject,
     deleteProject,
     renameProject,
+    updateProjectSettings,
     start,
     startPresentation,
     stop,

@@ -35,6 +35,7 @@ use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+mod cooldown;
 mod events;
 mod iteration;
 mod outputs;
@@ -43,16 +44,10 @@ mod state;
 mod task_runner;
 mod wave;
 
+pub use cooldown::CooldownInfo;
+
 pub mod preview;
 use preview::PreviewState;
-
-/// How long to back off between consecutive failed iterations, multiplied by
-/// the consecutive-failure count.
-const BACKOFF_STEP: Duration = Duration::from_millis(4000);
-
-/// How many iterations may fail back-to-back before the conductor parks
-/// itself in `Error`.
-const MAX_CONSECUTIVE_FAILURES: usize = 3;
 
 /// Sentinel returned in place of a real answer when the conductor is stopped
 /// while a specialist is waiting on `ask_user`.
@@ -210,6 +205,31 @@ impl Conductor {
         }
     }
 
+    /// Hot-swap the cached `ProjectRow` after the store has been mutated
+    /// (e.g. rename or settings update). Subsequent iterations / preview /
+    /// chat will read the fresh values without restarting the conductor.
+    pub fn refresh_project(&self, row: ProjectRow) {
+        self.inner.project.store(Arc::new(row));
+    }
+
+    /// Snapshot of the active cooldown (if any). The IPC `get_snapshot`
+    /// surfaces this to the frontend so it can draw the countdown.
+    pub fn cooldown_info(&self) -> Option<CooldownInfo> {
+        self.inner.cooldown.lock_or_poisoned().clone()
+    }
+
+    /// Wake the cooldown sleep early. Returns `true` if the conductor
+    /// was actually sleeping in cooldown and got woken; `false` otherwise
+    /// (no cooldown active — caller should fall through to regular Start).
+    pub fn skip_cooldown(&self) -> bool {
+        if let Some(tx) = self.inner.cooldown_skip.lock_or_poisoned().take() {
+            let _ = tx.send(());
+            true
+        } else {
+            false
+        }
+    }
+
     pub async fn answer_question(&self, question_id: &str, answer: String) {
         let _ = self.store.resolve_question(
             question_id,
@@ -240,10 +260,13 @@ impl Conductor {
         self: Arc<Self>,
         mut resume_iter: Option<IterationRow>,
     ) -> AppResult<()> {
-        let mut consecutive_failures = 0usize;
         loop {
             if self.is_cancelled() {
-                self.set_state(ConductorState::Idle)?;
+                // User pressed Stop. If there's still an iteration sitting
+                // as `Running` in the store, expose it as `Paused` so the
+                // dashboard offers a "Продолжить итерацию N" button instead
+                // of a fresh "Запустить". Otherwise fall back to Idle.
+                self.finalize_pause_or_idle()?;
                 return Ok(());
             }
             let state = self.current_state();
@@ -277,22 +300,100 @@ impl Conductor {
                 it
             };
 
-            let mut failed = false;
             if let Err(e) = self.clone().run_iteration(iter.clone()).await {
-                failed = true;
-                tracing::warn!("iteration {} failed: {e}", iter.number);
-                self.emit_for(
-                    EventPayload::IterationError {
-                        error: e.to_string(),
-                    },
-                    Some(iter.id.clone()),
-                    None,
+                let user_cancelled = self.is_cancelled();
+                let err_str = e.to_string();
+                tracing::warn!(
+                    "iteration {} stopped: {err_str} (user_cancelled={user_cancelled})",
+                    iter.number
                 );
-                self.store.set_iteration_status(
-                    &iter.id,
-                    IterationStatus::Failed,
-                    Some(&format!("Error: {e}")),
-                )?;
+
+                // Provider rate-limit? Sleep it out and retry the same
+                // iteration automatically. Iteration row stays `Running`,
+                // half-baked tasks reset, conductor is visually Paused
+                // with a `cooldown` block in the snapshot for the UI's
+                // countdown timer.
+                if !user_cancelled {
+                    if let Some(mut cd) = cooldown::detect_rate_limit(&err_str) {
+                        cd.iteration_id = Some(iter.id.clone());
+                        let retry_at_ms = cd.retry_at_ms;
+                        let reason = cd.reason.clone();
+                        *self.inner.cooldown.lock_or_poisoned() = Some(cd);
+                        self.emit_for(
+                            EventPayload::CooldownStarted {
+                                retry_at_ms,
+                                reason,
+                            },
+                            Some(iter.id.clone()),
+                            None,
+                        );
+                        let _ = self.store.reset_iteration_in_progress_tasks(&iter.id);
+                        self.set_state(ConductorState::Paused)?;
+
+                        // Sleep until retry_at, breaking on user-stop or
+                        // user "Continue now". The skip waker is stored on
+                        // Inner so the IPC layer can wake us.
+                        let (skip_tx, skip_rx) = oneshot::channel::<()>();
+                        *self.inner.cooldown_skip.lock_or_poisoned() = Some(skip_tx);
+
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let wait_ms = (retry_at_ms - now_ms).max(0) as u64;
+                        let cancel_token = self.cancel.lock_or_poisoned().clone();
+
+                        enum Wake {
+                            Elapsed,
+                            UserStop,
+                            Skipped,
+                        }
+                        let wake = tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => Wake::Elapsed,
+                            _ = cancel_token.cancelled() => Wake::UserStop,
+                            _ = skip_rx => Wake::Skipped,
+                        };
+
+                        *self.inner.cooldown_skip.lock_or_poisoned() = None;
+                        *self.inner.cooldown.lock_or_poisoned() = None;
+
+                        match wake {
+                            Wake::UserStop => {
+                                self.emit_for(
+                                    EventPayload::CooldownCancelled,
+                                    Some(iter.id.clone()),
+                                    None,
+                                );
+                                self.finalize_pause_or_idle()?;
+                                return Ok(());
+                            }
+                            Wake::Elapsed | Wake::Skipped => {
+                                self.emit_for(
+                                    EventPayload::CooldownEnded {
+                                        skipped_by_user: matches!(wake, Wake::Skipped),
+                                    },
+                                    Some(iter.id.clone()),
+                                    None,
+                                );
+                                // Pick the same iteration up next loop tick.
+                                resume_iter = Some(iter.clone());
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Plain error (not a rate limit) → surface to user.
+                    self.emit_for(
+                        EventPayload::IterationError {
+                            error: err_str,
+                        },
+                        Some(iter.id.clone()),
+                        None,
+                    );
+                }
+                // The iteration row stays `Running` in the store on purpose
+                // — `find_resumable_iteration` will pick it back up on the
+                // next Start. Reset half-baked tasks so they re-run cleanly.
+                let _ = self.store.reset_iteration_in_progress_tasks(&iter.id);
+                self.set_state(ConductorState::Paused)?;
+                return Ok(());
             }
 
             // Wrap-up requested during this iteration → go to preview, no new iter.
@@ -308,28 +409,6 @@ impl Conductor {
                         Some(IterationMode::Wrapup),
                     )
                     .ok();
-            }
-
-            if failed {
-                consecutive_failures += 1;
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    self.emit(EventPayload::TooManyFailures {
-                        consecutive: consecutive_failures,
-                    });
-                    self.set_state(ConductorState::Error)?;
-                    return Ok(());
-                }
-                let backoff = BACKOFF_STEP * consecutive_failures as u32;
-                self.emit(EventPayload::Backoff {
-                    duration_ms: backoff.as_millis() as u64,
-                    consecutive: consecutive_failures,
-                });
-                tokio::time::sleep(backoff).await;
-            } else {
-                consecutive_failures = 0;
-            }
-
-            if was_wrap {
                 self.set_state(ConductorState::PreparingPreview)?;
                 if let Err(e) = self.run_preview_prep().await {
                     let mut p = self.preview.lock().await;
@@ -341,13 +420,23 @@ impl Conductor {
                 self.set_state(ConductorState::Presenting)?;
                 self.await_resume().await;
                 if self.is_cancelled() {
-                    self.set_state(ConductorState::Idle)?;
+                    self.finalize_pause_or_idle()?;
                     return Ok(());
                 }
                 let _ = self.run_preview_shutdown().await;
                 self.set_state(ConductorState::Resuming)?;
                 self.emit(EventPayload::Resumed);
             }
+        }
+    }
+
+    /// Pick `Paused` vs `Idle` based on whether there's an iteration the
+    /// user can pick up next time. Used at every exit point of `run_loop`.
+    fn finalize_pause_or_idle(&self) -> AppResult<()> {
+        if self.store.find_resumable_iteration(&self.project_id).is_some() {
+            self.set_state(ConductorState::Paused)
+        } else {
+            self.set_state(ConductorState::Idle)
         }
     }
 

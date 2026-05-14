@@ -178,6 +178,24 @@ pub enum EventPayload {
     LoopError {
         error: String,
     },
+
+    // ---- Provider rate-limit cooldown ----
+    /// Emitted when the conductor classifies an agent error as a provider
+    /// rate-limit and decides to sleep instead of pausing. The UI uses
+    /// `retry_at_ms` for the countdown.
+    CooldownStarted {
+        retry_at_ms: i64,
+        reason: String,
+    },
+    /// Emitted when the cooldown sleep ended naturally (or because the
+    /// user pressed Continue to skip the wait). The conductor then retries
+    /// the same iteration.
+    CooldownEnded {
+        skipped_by_user: bool,
+    },
+    /// Emitted when the user pressed Stop during cooldown. The cooldown
+    /// is abandoned and the conductor falls into regular Paused.
+    CooldownCancelled,
 }
 
 impl EventPayload {

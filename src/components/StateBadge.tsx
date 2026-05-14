@@ -12,6 +12,7 @@ const META: Record<
   PREPARING_PREVIEW: { label: "Готовим демо", variant: "info", pulse: true },
   PRESENTING: { label: "Presenting", variant: "info" },
   RESUMING: { label: "Resuming", variant: "primary", pulse: true },
+  PAUSED: { label: "Paused", variant: "warning" },
   ERROR: { label: "Error", variant: "destructive" },
 };
 

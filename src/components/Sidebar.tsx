@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { FolderOpen, MoreVertical, Pencil, Plus, Trash2 } from "lucide-react";
+import { FolderOpen, MoreVertical, Pencil, Plus, Settings, Trash2 } from "lucide-react";
 import type { ProjectRow } from "../types";
 import { api } from "../lib/api";
 import { Button } from "./ui/button";
@@ -13,6 +13,7 @@ export function Sidebar({
   onNew,
   onDelete,
   onRename,
+  onSettings,
 }: {
   projects: ProjectRow[];
   activeId: string | null;
@@ -20,6 +21,7 @@ export function Sidebar({
   onNew: () => void;
   onDelete: (project: ProjectRow) => void;
   onRename: (project: ProjectRow) => void;
+  onSettings: (project: ProjectRow) => void;
 }) {
   return (
     <aside className="flex flex-col w-[280px] shrink-0 border-r border-border bg-card/30">
@@ -47,6 +49,7 @@ export function Sidebar({
             onSelect={() => onSelect(p.id)}
             onDelete={() => onDelete(p)}
             onRename={() => onRename(p)}
+            onSettings={() => onSettings(p)}
             onOpenFolder={() => api.openExternal(p.root_path)}
           />
         ))}
@@ -61,6 +64,7 @@ function ProjectItem({
   onSelect,
   onDelete,
   onRename,
+  onSettings,
   onOpenFolder,
 }: {
   project: ProjectRow;
@@ -68,6 +72,7 @@ function ProjectItem({
   onSelect: () => void;
   onDelete: () => void;
   onRename: () => void;
+  onSettings: () => void;
   onOpenFolder: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -140,6 +145,13 @@ function ProjectItem({
             onClick={() => { setMenuOpen(false); onRename(); }}
           >
             {running ? "Изменить идею (после стопа)" : "Изменить идею"}
+          </MenuItem>
+          <MenuItem
+            icon={<Settings className="h-3.5 w-3.5" />}
+            disabled={running}
+            onClick={() => { setMenuOpen(false); onSettings(); }}
+          >
+            {running ? "CLI и модели (после стопа)" : "CLI и модели"}
           </MenuItem>
           <Separator className="my-1" />
           <MenuItem

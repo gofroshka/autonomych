@@ -292,6 +292,29 @@ export function humanize(ev: EventRow): HumanEvent | null {
     case "loop_error":
       return { ...base, role: null, kind: "error", action: "Сбой цикла", target: p.error.slice(0, 200) };
 
+    // ---- Provider rate-limit cooldown ----
+    case "cooldown_started": {
+      const ts = new Date(p.retry_at_ms);
+      const hh = ts.getHours().toString().padStart(2, "0");
+      const mm = ts.getMinutes().toString().padStart(2, "0");
+      return {
+        ...base,
+        role: null,
+        kind: "directive",
+        action: `Лимит провайдера — продолжим в ${hh}:${mm}`,
+        target: p.reason.slice(0, 200),
+      };
+    }
+    case "cooldown_ended":
+      return {
+        ...base,
+        role: null,
+        kind: "info",
+        action: p.skipped_by_user ? "Кулдаун пропущен — продолжаем" : "Кулдаун закончился — продолжаем",
+      };
+    case "cooldown_cancelled":
+      return { ...base, role: null, kind: "directive", action: "Кулдаун отменён пользователем" };
+
     default: {
       // Exhaustiveness check — never narrows in practice; if a new variant
       // is added on the Rust side without updating this switch, TS will fail

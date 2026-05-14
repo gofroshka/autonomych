@@ -3,14 +3,17 @@ import {
   AlertTriangle,
   FolderOpen,
   Loader2,
+  MessageSquare,
   RotateCcw,
+  Send,
   Sparkles,
   Wrench,
   XCircle,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { DashboardSnapshot, ProjectRow, SteeringMode } from "../types";
+import type { BacklogCategory, BacklogPriority, DashboardSnapshot, ProjectRow, SteeringMode } from "../types";
+import { CategorySelector } from "./BacklogPanel";
 import { api } from "../lib/api";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -21,16 +24,40 @@ import { cn } from "../lib/cn";
  *  so the click registers visually even when the IPC call resolves instantly. */
 const RETRY_FEEDBACK_MS = 1500;
 
+/** One turn in the user↔Presenter chat. Ephemeral component-local state. */
+interface PresenterTurn {
+  id: string;
+  from: "user" | "presenter";
+  text: string;
+  /** Set on presenter turns when the agent attached a draft steering. */
+  draftSteering?: string;
+}
+
 interface Props {
   project: ProjectRow;
   snapshot: DashboardSnapshot | null;
   onResume: (msg: string, mode: SteeringMode) => void;
+  /** Fires after the user adds something to the backlog from this overlay,
+   *  so the parent can refresh the snapshot and update the right-panel
+   *  badge count. */
+  onBacklogChanged: () => void;
 }
 
-export function PresentingOverlay({ project, snapshot, onResume }: Props) {
-  const [steering, setSteering] = useState("");
-  const [mode, setMode] = useState<SteeringMode>("soft");
+export function PresentingOverlay({ project, snapshot, onResume, onBacklogChanged }: Props) {
+  // Single compose form — user types feedback, picks a category (bug /
+  // critical / feature / wish / ...), hits "+ В беклог". Can add multiple
+  // before pressing "Продолжаем". PO of the next iteration honours category
+  // ordering on its own (bugs before features); no override / direct prompt
+  // injection involved.
+  const [backlogText, setBacklogText] = useState("");
+  const [backlogCategory, setBacklogCategory] = useState<BacklogCategory>("bug");
+  const [backlogPriority, setBacklogPriority] = useState<BacklogPriority>("normal");
+  const [addingToBacklog, setAddingToBacklog] = useState(false);
+  const [justAddedCount, setJustAddedCount] = useState(0);
   const [retrying, setRetrying] = useState(false);
+  const [chatTurns, setChatTurns] = useState<PresenterTurn[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatSending, setChatSending] = useState(false);
 
   const state = snapshot?.project?.state ?? "PRESENTING";
   const preview = snapshot?.preview;
@@ -38,6 +65,46 @@ export function PresentingOverlay({ project, snapshot, onResume }: Props) {
   const isPreparing = state === "PREPARING_PREVIEW";
   const hasInstructions = !!preview?.instructions;
   const hasError = !isPreparing && !!preview?.prep_error;
+
+  const sendChat = async () => {
+    const trimmed = chatInput.trim();
+    if (!trimmed || chatSending) return;
+    setChatInput("");
+    setChatSending(true);
+    const turnId = `t-${Date.now()}`;
+    setChatTurns((prev) => [...prev, { id: turnId, from: "user", text: trimmed }]);
+    try {
+      const r = await api.presenterChat(project.id, trimmed);
+      setChatTurns((prev) => [
+        ...prev,
+        {
+          id: `t-${Date.now()}-r`,
+          from: "presenter",
+          text: r.reply,
+          draftSteering: r.draft_steering ?? undefined,
+        },
+      ]);
+    } catch (e) {
+      setChatTurns((prev) => [
+        ...prev,
+        {
+          id: `t-${Date.now()}-e`,
+          from: "presenter",
+          text: `_Не получилось спросить Presenter'а: ${String(e)}_`,
+        },
+      ]);
+    } finally {
+      setChatSending(false);
+    }
+  };
+
+  // Presenter chat-replies can attach a `draft_steering` string — usually a
+  // succinct description of a code-side bug. Stuff it into the backlog
+  // compose box so the user can review and click "+ В беклог" (or move it
+  // to override if it's truly critical).
+  const applyDraft = (text: string) => {
+    setBacklogText((cur) => (cur.trim() ? `${cur.trim()}\n\n${text}` : text));
+  };
 
   const retry = async () => {
     setRetrying(true);
@@ -164,41 +231,133 @@ export function PresentingOverlay({ project, snapshot, onResume }: Props) {
           </div>
         </section>
 
-        <section className="space-y-2 pt-2 border-t border-border">
-          <Label>Курс-коррекция (опционально)</Label>
-          <Textarea
-            rows={4}
-            value={steering}
-            onChange={(e) => setSteering(e.target.value)}
-            placeholder="Например: «Цвета слишком яркие». Или ничего не пиши — продолжим как было."
-          />
-          <div className="flex items-center gap-3 flex-wrap pt-1">
-            <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-              <input
-                type="radio"
-                className="h-3.5 w-3.5"
-                checked={mode === "soft"}
-                onChange={() => setMode("soft")}
+        {!isPreparing && (
+          <section className="space-y-3 pt-2 border-t border-border">
+            <div className="space-y-1">
+              <Label>
+                <MessageSquare className="inline h-3.5 w-3.5 mr-1.5 -mt-0.5" />
+                Сообщить Presenter'у о проблеме
+              </Label>
+              <p className="text-[11px] text-muted-foreground leading-relaxed">
+                Если демо работает не так как ожидаешь — напиши. Presenter сам разберётся:
+                починит запуск если это его косяк (порт, env, перезапуск),
+                либо предложит черновик правки для следующей итерации если это баг в коде.
+              </p>
+            </div>
+
+            {chatTurns.length > 0 && (
+              <div className="space-y-2.5">
+                {chatTurns.map((turn) => (
+                  <PresenterChatTurn
+                    key={turn.id}
+                    turn={turn}
+                    onApplyDraft={() => turn.draftSteering && applyDraft(turn.draftSteering)}
+                  />
+                ))}
+              </div>
+            )}
+
+            <div className="flex gap-2">
+              <Textarea
+                rows={2}
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    sendChat();
+                  }
+                }}
+                placeholder="Например: «при открытии товара фронт идёт на 5000 порт, а сервер на 3000»"
+                disabled={chatSending}
+                className="resize-none flex-1"
               />
-              <span className={cn(mode === "soft" ? "text-foreground" : "text-muted-foreground")}>
-                soft (направление для PO)
-              </span>
-            </label>
-            <label className="flex items-center gap-1.5 text-xs cursor-pointer">
-              <input
-                type="radio"
-                className="h-3.5 w-3.5"
-                checked={mode === "override"}
-                onChange={() => setMode("override")}
-              />
-              <span
-                className={cn(mode === "override" ? "text-foreground" : "text-muted-foreground")}
+              <Button
+                onClick={sendChat}
+                disabled={!chatInput.trim() || chatSending}
+                size="sm"
+                className="gap-1.5 self-end"
               >
-                override (выполнить буквально)
-              </span>
-            </label>
+                <Send className="h-3 w-3" />
+                {chatSending ? "Разбираюсь…" : "Спросить"}
+              </Button>
+            </div>
+          </section>
+        )}
+
+        <section className="space-y-3 pt-2 border-t border-border">
+          <div className="flex items-baseline justify-between gap-2">
+            <Label>Правки и идеи → в беклог</Label>
+            <span className="text-[11px] text-muted-foreground">
+              Можно добавлять сколько хочешь. PO сначала закрывает критич/баги, потом фичи.
+            </span>
+          </div>
+          <Textarea
+            rows={3}
+            value={backlogText}
+            onChange={(e) => setBacklogText(e.target.value)}
+            placeholder="Например: «Главная страница 500-тит при логине», «добавить экспорт в CSV», «цвета слишком яркие»."
+          />
+          <CategorySelector value={backlogCategory} onChange={setBacklogCategory} />
+          <div className="flex items-center gap-3 flex-wrap">
+            <span className="text-[11px] text-muted-foreground">Приоритет:</span>
+            {(["high", "normal", "low"] as const).map((p) => (
+              <label key={p} className="flex items-center gap-1 text-xs cursor-pointer">
+                <input
+                  type="radio"
+                  className="h-3 w-3"
+                  checked={backlogPriority === p}
+                  onChange={() => setBacklogPriority(p)}
+                />
+                <span
+                  className={cn(
+                    backlogPriority === p ? "text-foreground" : "text-muted-foreground"
+                  )}
+                >
+                  {p}
+                </span>
+              </label>
+            ))}
             <div className="flex-1" />
-            <Button onClick={() => onResume(steering, mode)} disabled={isPreparing}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={async () => {
+                const text = backlogText.trim();
+                if (!text || addingToBacklog) return;
+                setAddingToBacklog(true);
+                try {
+                  await api.addBacklogItem(project.id, text, {
+                    category: backlogCategory,
+                    priority: backlogPriority,
+                  });
+                  setBacklogText("");
+                  setJustAddedCount((n) => n + 1);
+                  onBacklogChanged();
+                } finally {
+                  setAddingToBacklog(false);
+                }
+              }}
+              disabled={!backlogText.trim() || addingToBacklog}
+              className="gap-1.5"
+            >
+              {addingToBacklog ? "Добавляю…" : "+ В беклог"}
+            </Button>
+          </div>
+          {justAddedCount > 0 && (
+            <p className="text-[11px] text-success">
+              ✓ Добавлено в беклог: {justAddedCount}. Можешь добавить ещё или сразу продолжить.
+            </p>
+          )}
+          <div className="flex items-center gap-2 pt-2 border-t border-border/50">
+            <div className="flex-1 text-[11px] text-muted-foreground">
+              {backlogText.trim() && (
+                <span className="block">
+                  ⚠️ В поле есть текст — он не сохранится, если не нажать «+ В беклог».
+                </span>
+              )}
+            </div>
+            <Button onClick={() => onResume("", "soft")} disabled={isPreparing}>
               Продолжаем
             </Button>
           </div>
@@ -254,6 +413,52 @@ function InstructionsBlock({ text }: { text: string }) {
       >
         {text}
       </ReactMarkdown>
+    </div>
+  );
+}
+
+/**
+ * One turn in the user↔Presenter chat. User messages render as plain text
+ * (whitespace-preserving), Presenter replies render through the same
+ * markdown pipeline as the launch instructions block. If the agent
+ * attached a draft steering, a small action button below the bubble
+ * copies it into the course-correction textarea above.
+ */
+function PresenterChatTurn({
+  turn,
+  onApplyDraft,
+}: {
+  turn: PresenterTurn;
+  onApplyDraft: () => void;
+}) {
+  const isUser = turn.from === "user";
+  return (
+    <div className={cn("flex flex-col gap-1.5", isUser ? "items-end" : "items-start")}>
+      <div
+        className={cn(
+          "max-w-[88%] rounded-lg px-3 py-2 text-[13px] leading-relaxed break-words",
+          isUser
+            ? "bg-primary text-primary-foreground whitespace-pre-wrap"
+            : "bg-card border border-border"
+        )}
+      >
+        {isUser ? turn.text : <InstructionsBlock text={turn.text} />}
+      </div>
+      {turn.draftSteering && (
+        <div className="max-w-[88%] flex items-start gap-2 px-3 py-2 rounded-lg border border-info/40 bg-info/5">
+          <div className="flex-1 min-w-0 space-y-1.5">
+            <div className="text-[11px] text-info font-medium">
+              Presenter предлагает курс-коррекцию
+            </div>
+            <div className="text-[12px] text-foreground/80 leading-snug whitespace-pre-wrap">
+              {turn.draftSteering}
+            </div>
+          </div>
+          <Button size="sm" variant="outline" onClick={onApplyDraft} className="shrink-0 h-7 text-[11px]">
+            Применить
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

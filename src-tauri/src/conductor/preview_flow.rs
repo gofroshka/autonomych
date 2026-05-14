@@ -3,7 +3,7 @@
 //! dev-server lifecycle — we never touch PIDs, ports, or manifests.
 
 use super::Conductor;
-use crate::agents::{run_agent, system_prompt, tools_for, AgentInvocation};
+use crate::agents::{presenter_chat_prompt, run_agent, system_prompt, tools_for, AgentInvocation};
 use crate::error::AppResult;
 use crate::events::EventPayload;
 use crate::types::*;
@@ -115,7 +115,7 @@ impl Conductor {
         self.set_state(ConductorState::Presenting)?;
         self.await_resume().await;
         if self.is_cancelled() {
-            self.set_state(ConductorState::Idle)?;
+            self.finalize_pause_or_idle()?;
             return Ok(());
         }
         let _ = self.run_preview_shutdown().await;
@@ -123,6 +123,57 @@ impl Conductor {
         self.emit(EventPayload::Resumed);
         // After Path B's presentation, fall into the normal cycle.
         self.run_loop(None).await
+    }
+
+    /// Mid-demo chat with the Presenter agent. The user reports an issue
+    /// with the running demo (wrong API URL, server didn't come up, etc.);
+    /// the agent decides:
+    ///   - launch-side problem → fixes via Bash (restart, env, port)
+    ///   - code-side bug → drafts a steering note via DRAFT_STEERING marker
+    ///   - unclear → asks back
+    pub async fn presenter_chat(
+        self: Arc<Self>,
+        user_message: String,
+    ) -> AppResult<PresenterChatReply> {
+        let project = self.project_snapshot();
+        let prev = self
+            .preview
+            .lock()
+            .await
+            .instructions
+            .clone()
+            .unwrap_or_else(|| "(нет данных о прошлом запуске)".into());
+
+        let prompt = format!(
+            "Корень проекта: {} — ты в нём.\n\n--- ТВОЁ ПРОШЛОЕ СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЮ ПРИ ЗАПУСКЕ ДЕМО ---\n{prev}\n\n--- ПОЛЬЗОВАТЕЛЬ ПИШЕТ СЕЙЧАС ---\n{user_message}\n\nРазберись, действуй по системному промпту.",
+            project.root_path,
+        );
+
+        let inv = AgentInvocation {
+            role: AgentRole::Presenter,
+            system_prompt: presenter_chat_prompt().to_string(),
+            user_prompt: prompt,
+            cwd: PathBuf::from(&project.root_path),
+            model: project.model_specialist.clone(),
+            tools: tools_for(AgentRole::Presenter),
+            permission_mode: project.permission_mode,
+            max_turns: 20,
+            claude_code_preset: true,
+            cancel: Some(self.cancel_token()),
+            backend: project.agent_backend,
+        };
+        let publisher = self.event_publisher();
+        let res = run_agent(inv, move |ev| {
+            publisher.publish_agent_event(ev, None, None);
+        })
+        .await?;
+
+        let raw = res.final_text.trim().to_string();
+        let (reply, draft_steering) = split_draft_steering(&raw);
+        Ok(PresenterChatReply {
+            reply,
+            draft_steering,
+        })
     }
 
     /// Build the AgentInvocation shape used by both Presenter calls.
@@ -145,6 +196,62 @@ impl Conductor {
             max_turns,
             claude_code_preset: true,
             cancel: Some(self.cancel_token()),
+            backend: project.agent_backend,
         }
+    }
+}
+
+/// Split the Presenter's chat reply into (markdown-for-user, optional draft
+/// steering). The marker block, if present, is removed from the user-facing
+/// text — UI shows the suggestion as a separate "apply to steering" badge.
+fn split_draft_steering(text: &str) -> (String, Option<String>) {
+    const BEGIN: &str = "DRAFT_STEERING_BEGIN";
+    const END: &str = "DRAFT_STEERING_END";
+    let Some(b) = text.find(BEGIN) else {
+        return (text.trim().to_string(), None);
+    };
+    let after_begin = &text[b + BEGIN.len()..];
+    let Some(e) = after_begin.find(END) else {
+        // Malformed — agent opened the marker but didn't close it. Keep the
+        // full text visible so nothing is silently lost.
+        return (text.trim().to_string(), None);
+    };
+    let draft = after_begin[..e].trim().to_string();
+    let before = text[..b].trim();
+    let after = after_begin[e + END.len()..].trim();
+    let reply = match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => before.to_string(),
+        (true, false) => after.to_string(),
+        (false, false) => format!("{before}\n\n{after}"),
+    };
+    let draft_opt = (!draft.is_empty()).then_some(draft);
+    (reply, draft_opt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_marker_passes_through() {
+        let (reply, draft) = split_draft_steering("просто текст");
+        assert_eq!(reply, "просто текст");
+        assert_eq!(draft, None);
+    }
+
+    #[test]
+    fn extracts_marker_block() {
+        let text = "Это баг в коде.\n\nDRAFT_STEERING_BEGIN\nИсправь API URL в client.ts\nDRAFT_STEERING_END";
+        let (reply, draft) = split_draft_steering(text);
+        assert_eq!(reply, "Это баг в коде.");
+        assert_eq!(draft.as_deref(), Some("Исправь API URL в client.ts"));
+    }
+
+    #[test]
+    fn malformed_marker_keeps_full_text() {
+        let (reply, draft) = split_draft_steering("оборванный DRAFT_STEERING_BEGIN без конца");
+        assert_eq!(reply, "оборванный DRAFT_STEERING_BEGIN без конца");
+        assert_eq!(draft, None);
     }
 }

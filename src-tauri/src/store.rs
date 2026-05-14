@@ -10,7 +10,7 @@
 //!   <data>/chat.json
 //!   <data>/events/<project_id>.jsonl  — append-only event log
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::events::EventPayload;
 use crate::types::*;
 use crate::util::RwLockExt;
@@ -38,6 +38,7 @@ struct Inner {
     steering: HashMap<String, SteeringRow>,
     questions: HashMap<String, QuestionRow>,
     chat: HashMap<String, ChatMessageRow>,
+    backlog: HashMap<String, BacklogItem>,
 }
 
 fn now_ms() -> i64 {
@@ -102,6 +103,8 @@ impl Store {
         let questions =
             load_collection(&data_dir.join("questions.json"), |q: &QuestionRow| &q.id);
         let chat = load_collection(&data_dir.join("chat.json"), |c: &ChatMessageRow| &c.id);
+        let backlog =
+            load_collection(&data_dir.join("backlog.json"), |b: &BacklogItem| &b.id);
         Ok(Self {
             data_dir,
             inner: RwLock::new(Inner {
@@ -111,12 +114,22 @@ impl Store {
                 steering,
                 questions,
                 chat,
+                backlog,
             }),
         })
     }
 
     // ---- Projects ----
     pub fn create_project(&self, input: CreateProjectInput) -> AppResult<ProjectRow> {
+        let backend = input.agent_backend.unwrap_or_default();
+        // Default model names depend on the backend. Claude understands
+        // family aliases (opus/sonnet/haiku); Codex wants explicit OpenAI
+        // model names. In both cases the string is passed verbatim to
+        // `--model`, so anything the CLI accepts works.
+        let (default_pm, default_spec) = match backend {
+            AgentBackend::ClaudeCode => ("opus", "sonnet"),
+            AgentBackend::Codex => ("gpt-5.4", "gpt-5.3-codex"),
+        };
         let row = ProjectRow {
             id: nano(10),
             name: input.name,
@@ -124,15 +137,14 @@ impl Store {
             root_path: input.root_path,
             state: ConductorState::Idle,
             created_at: now_ms(),
-            // Defaults are CLI aliases — they automatically resolve to the
-            // latest model of each family, so a project created today is
-            // still using "the current Opus" a year from now without any
-            // code changes.
-            model_pm: input.model_pm.unwrap_or_else(|| "opus".into()),
-            model_specialist: input.model_specialist.unwrap_or_else(|| "sonnet".into()),
+            model_pm: input.model_pm.unwrap_or_else(|| default_pm.into()),
+            model_specialist: input
+                .model_specialist
+                .unwrap_or_else(|| default_spec.into()),
             permission_mode: input
                 .permission_mode
                 .unwrap_or(PermissionMode::BypassPermissions),
+            agent_backend: backend,
         };
         self.inner
             .write_or_poisoned()
@@ -168,6 +180,34 @@ impl Store {
         self.flush_projects()
     }
 
+    /// Update the "advanced" settings of a project: which CLI to spawn, the
+    /// model identifiers, and the permission mode. The fresh `ProjectRow` is
+    /// returned so the caller can refresh any cached copy (e.g. the
+    /// conductor's `ArcSwap<ProjectRow>`).
+    pub fn update_project_settings(
+        &self,
+        id: &str,
+        model_pm: &str,
+        model_specialist: &str,
+        permission_mode: PermissionMode,
+        agent_backend: AgentBackend,
+    ) -> AppResult<ProjectRow> {
+        let updated = {
+            let mut g = self.inner.write_or_poisoned();
+            let p = g
+                .projects
+                .get_mut(id)
+                .ok_or_else(|| AppError::ProjectNotFound(id.to_string()))?;
+            p.model_pm = model_pm.to_string();
+            p.model_specialist = model_specialist.to_string();
+            p.permission_mode = permission_mode;
+            p.agent_backend = agent_backend;
+            p.clone()
+        };
+        self.flush_projects()?;
+        Ok(updated)
+    }
+
     /// Cascade-delete a project and everything attached to it in one lock
     /// acquisition. The on-disk event log is removed too.
     pub fn delete_project(&self, id: &str) -> AppResult<()> {
@@ -185,6 +225,7 @@ impl Store {
             g.steering.retain(|_, s| s.project_id != id);
             g.questions.retain(|_, q| q.project_id != id);
             g.chat.retain(|_, c| c.project_id != id);
+            g.backlog.retain(|_, b| b.project_id != id);
         }
         self.flush_all()?;
         let ev = self.data_dir.join("events").join(format!("{id}.jsonl"));
@@ -194,6 +235,39 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Reset all in-progress tasks of a single iteration back to `Pending` so
+    /// they can be re-run cleanly from the start. Used when the conductor
+    /// pauses mid-iteration (user pressed Stop, or an agent errored): the
+    /// half-done specialists are killed via cancellation, their git state
+    /// may be inconsistent, so we wipe their status. The iteration row
+    /// itself stays `Running` — that's what makes it resumable.
+    /// Also cancels any pending question that was blocking a specialist.
+    pub fn reset_iteration_in_progress_tasks(&self, iteration_id: &str) -> AppResult<usize> {
+        let mut changed = 0usize;
+        {
+            let mut g = self.inner.write_or_poisoned();
+            for t in g.tasks.values_mut() {
+                if t.iteration_id == iteration_id && matches!(t.status, TaskStatus::InProgress) {
+                    t.status = TaskStatus::Pending;
+                    t.started_at = None;
+                    t.ended_at = None;
+                    changed += 1;
+                }
+            }
+            for q in g.questions.values_mut() {
+                if q.iteration_id.as_deref() == Some(iteration_id)
+                    && matches!(q.status, QuestionStatus::Pending)
+                {
+                    q.status = QuestionStatus::Cancelled;
+                    q.answered_at = Some(now_ms());
+                }
+            }
+        }
+        self.flush_tasks()?;
+        self.flush_questions()?;
+        Ok(changed)
     }
 
     /// On app startup nothing is running yet — drop any lingering "in flight"
@@ -240,6 +314,15 @@ impl Store {
                     q.status = QuestionStatus::Cancelled;
                     q.answered_at = Some(now_ms());
                     questions_changed += 1;
+                }
+            }
+            // Backlog items pinned to an active iteration that we just reset
+            // need to come back to Pending — otherwise PO won't see them on
+            // the resumed iteration's prompt.
+            for b in g.backlog.values_mut() {
+                if matches!(b.status, BacklogStatus::InIteration) {
+                    b.status = BacklogStatus::Pending;
+                    b.picked_in_iteration_id = None;
                 }
             }
         }
@@ -527,6 +610,12 @@ impl Store {
             .cloned()
     }
 
+    /// Kept for backward compatibility with existing `steering.json` files.
+    /// As of the category-based backlog rollout the conductor no longer
+    /// injects steering rows into the PO prompt — all user input flows
+    /// through the backlog instead. This method may go away once we drop
+    /// the SteeringRow storage entirely.
+    #[allow(dead_code)]
     pub fn consume_steering(&self, id: &str, iteration_id: &str) -> AppResult<()> {
         if let Some(s) = self.inner.write_or_poisoned().steering.get_mut(id) {
             s.applied_iteration_id = Some(iteration_id.to_string());
@@ -650,6 +739,209 @@ impl Store {
         list
     }
 
+    // ---- Backlog ----
+    //
+    // Items are mutated frequently (PO picks, Reviewer closes, runtime
+    // auto-adds), so methods are deliberately small and each one flushes
+    // backlog.json on its own. No batching, no transactions — the volume
+    // is tiny (tens of items per project).
+
+    pub fn add_backlog(&self, project_id: &str, new: NewBacklogItem) -> AppResult<BacklogItem> {
+        let row = BacklogItem {
+            id: nano(10),
+            project_id: project_id.to_string(),
+            title: new.title,
+            details: new.details,
+            source: new.source,
+            category: new.category,
+            priority: new.priority,
+            status: BacklogStatus::Pending,
+            created_at: now_ms(),
+            picked_in_iteration_id: None,
+            origin_iteration_id: new.origin_iteration_id,
+            origin_task_id: new.origin_task_id,
+            completed_at: None,
+        };
+        self.inner
+            .write_or_poisoned()
+            .backlog
+            .insert(row.id.clone(), row.clone());
+        self.flush_backlog()?;
+        Ok(row)
+    }
+
+    /// Insert if no existing item for the same `origin_task_id` exists.
+    /// Used by the auto-population path so re-running an iteration with
+    /// the same failed task doesn't multiply backlog entries.
+    pub fn add_backlog_for_task_if_missing(
+        &self,
+        project_id: &str,
+        new: NewBacklogItem,
+    ) -> AppResult<Option<BacklogItem>> {
+        if let Some(task_id) = new.origin_task_id.as_ref() {
+            let exists = self.inner.read_or_poisoned().backlog.values().any(|b| {
+                b.project_id == project_id
+                    && b.origin_task_id.as_deref() == Some(task_id.as_str())
+                    && matches!(
+                        b.status,
+                        BacklogStatus::Pending | BacklogStatus::InIteration
+                    )
+            });
+            if exists {
+                return Ok(None);
+            }
+        }
+        self.add_backlog(project_id, new).map(Some)
+    }
+
+    /// All items for a project, sorted: InIteration first, then Pending by
+    /// priority (High → Low), then Done/Dismissed by recency. The UI shows
+    /// this list verbatim.
+    pub fn list_backlog(&self, project_id: &str) -> Vec<BacklogItem> {
+        let mut v: Vec<BacklogItem> = self
+            .inner
+            .read_or_poisoned()
+            .backlog
+            .values()
+            .filter(|b| b.project_id == project_id)
+            .cloned()
+            .collect();
+        v.sort_by_key(|b| {
+            let status_rank = match b.status {
+                BacklogStatus::InIteration => 0,
+                BacklogStatus::Pending => 1,
+                BacklogStatus::Done => 2,
+                BacklogStatus::Dismissed => 3,
+            };
+            // Category drives the primary order for Pending items — this is
+            // what makes PO naturally fix bugs before building features.
+            let category_rank = match b.category {
+                BacklogCategory::Critical => 0,
+                BacklogCategory::Bug => 1,
+                BacklogCategory::TechDebt => 2,
+                BacklogCategory::Feature => 3,
+                BacklogCategory::Wish => 4,
+            };
+            let prio_rank = match b.priority {
+                BacklogPriority::High => 0,
+                BacklogPriority::Normal => 1,
+                BacklogPriority::Low => 2,
+            };
+            (status_rank, category_rank, prio_rank, -b.created_at)
+        });
+        v
+    }
+
+    /// Only the items PO should see in its prompt: Pending + InIteration.
+    pub fn active_backlog(&self, project_id: &str) -> Vec<BacklogItem> {
+        self.list_backlog(project_id)
+            .into_iter()
+            .filter(|b| {
+                matches!(
+                    b.status,
+                    BacklogStatus::Pending | BacklogStatus::InIteration
+                )
+            })
+            .collect()
+    }
+
+    /// Mark a set of items as picked into the active iteration. Any ids that
+    /// don't exist or aren't Pending are silently skipped.
+    pub fn pick_backlog(&self, ids: &[String], iteration_id: &str) -> AppResult<usize> {
+        let mut changed = 0usize;
+        {
+            let mut g = self.inner.write_or_poisoned();
+            for id in ids {
+                if let Some(b) = g.backlog.get_mut(id) {
+                    if matches!(b.status, BacklogStatus::Pending) {
+                        b.status = BacklogStatus::InIteration;
+                        b.picked_in_iteration_id = Some(iteration_id.to_string());
+                        changed += 1;
+                    }
+                }
+            }
+        }
+        if changed > 0 {
+            self.flush_backlog()?;
+        }
+        Ok(changed)
+    }
+
+    /// Close a set of items — Reviewer signed them off. Items not in
+    /// `InIteration` are ignored.
+    pub fn close_backlog(&self, ids: &[String]) -> AppResult<usize> {
+        let mut changed = 0usize;
+        {
+            let mut g = self.inner.write_or_poisoned();
+            for id in ids {
+                if let Some(b) = g.backlog.get_mut(id) {
+                    if matches!(b.status, BacklogStatus::InIteration) {
+                        b.status = BacklogStatus::Done;
+                        b.completed_at = Some(now_ms());
+                        changed += 1;
+                    }
+                }
+            }
+        }
+        if changed > 0 {
+            self.flush_backlog()?;
+        }
+        Ok(changed)
+    }
+
+    /// Revert all InIteration items of a given iteration back to Pending.
+    /// Used when the iteration ends without explicit closure — items stay
+    /// active for the next round.
+    pub fn revert_backlog_for_iteration(&self, iteration_id: &str) -> AppResult<usize> {
+        let mut changed = 0usize;
+        {
+            let mut g = self.inner.write_or_poisoned();
+            for b in g.backlog.values_mut() {
+                if b.picked_in_iteration_id.as_deref() == Some(iteration_id)
+                    && matches!(b.status, BacklogStatus::InIteration)
+                {
+                    b.status = BacklogStatus::Pending;
+                    b.picked_in_iteration_id = None;
+                    changed += 1;
+                }
+            }
+        }
+        if changed > 0 {
+            self.flush_backlog()?;
+        }
+        Ok(changed)
+    }
+
+    /// User dismissed an item — explicit "no, not doing this".
+    pub fn dismiss_backlog(&self, id: &str) -> AppResult<()> {
+        if let Some(b) = self.inner.write_or_poisoned().backlog.get_mut(id) {
+            b.status = BacklogStatus::Dismissed;
+            b.completed_at = Some(now_ms());
+        }
+        self.flush_backlog()
+    }
+
+    pub fn update_backlog(
+        &self,
+        id: &str,
+        title: Option<String>,
+        details: Option<String>,
+        priority: Option<BacklogPriority>,
+    ) -> AppResult<()> {
+        if let Some(b) = self.inner.write_or_poisoned().backlog.get_mut(id) {
+            if let Some(t) = title {
+                b.title = t;
+            }
+            if let Some(d) = details {
+                b.details = d;
+            }
+            if let Some(p) = priority {
+                b.priority = p;
+            }
+        }
+        self.flush_backlog()
+    }
+
     // ---- flush helpers ----
     //
     // Each helper takes a snapshot of one collection's values and writes them
@@ -661,7 +953,8 @@ impl Store {
         self.flush_tasks()?;
         self.flush_steering()?;
         self.flush_questions()?;
-        self.flush_chat()
+        self.flush_chat()?;
+        self.flush_backlog()
     }
 
     fn flush_projects(&self) -> AppResult<()> {
@@ -694,6 +987,11 @@ impl Store {
         let vec: Vec<&ChatMessageRow> = g.chat.values().collect();
         write_json_atomic(&self.data_dir.join("chat.json"), &vec)
     }
+    fn flush_backlog(&self) -> AppResult<()> {
+        let g = self.inner.read_or_poisoned();
+        let vec: Vec<&BacklogItem> = g.backlog.values().collect();
+        write_json_atomic(&self.data_dir.join("backlog.json"), &vec)
+    }
 }
 
 #[cfg(test)]
@@ -715,6 +1013,7 @@ mod tests {
             model_pm: None,
             model_specialist: None,
             permission_mode: None,
+            agent_backend: None,
         })
         .expect("create")
     }

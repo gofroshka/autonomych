@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { ChevronDown, ChevronUp, Clock, Hash, History, Lock, Pencil, Target } from "lucide-react";
+import { ChevronDown, ChevronUp, Clock, Hash, History, Lock, Pencil, Settings, Target } from "lucide-react";
 import type { IterationRow, ProjectRow, TaskRow } from "../types";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -7,13 +7,14 @@ import { cn } from "../lib/cn";
 import { formatDuration } from "../lib/format";
 
 export function IterationHeader({
-  project, iteration, tasks, isRunning, onEditProject, onShowHistory,
+  project, iteration, tasks, isRunning, onEditProject, onSettings, onShowHistory,
 }: {
   project: ProjectRow;
   iteration: IterationRow | null;
   tasks: TaskRow[];
   isRunning: boolean;
   onEditProject: () => void;
+  onSettings: () => void;
   onShowHistory: () => void;
 }) {
   const [ideaOpen, setIdeaOpen] = useState(false);
@@ -40,6 +41,9 @@ export function IterationHeader({
             <h1 className="text-base font-semibold truncate">{project.name}</h1>
             <Button variant="ghost" size="icon" className="h-6 w-6" onClick={onEditProject} disabled={isRunning} title={isRunning ? "Останови цикл, чтобы редактировать" : "Изменить идею"}>
               {isRunning ? <Lock className="h-3 w-3" /> : <Pencil className="h-3 w-3" />}
+            </Button>
+            <Button variant="ghost" size="icon" className="h-6 w-6" onClick={onSettings} disabled={isRunning} title={isRunning ? "Останови цикл, чтобы менять CLI и модели" : "CLI и модели"}>
+              <Settings className="h-3 w-3" />
             </Button>
             <Button variant="ghost" size="icon" className="h-6 w-6" onClick={onShowHistory} title="История проекта">
               <History className="h-3 w-3" />

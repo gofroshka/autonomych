@@ -30,6 +30,14 @@ pub(super) struct Inner {
     pub wrap_up_requested: AtomicBool,
     pub waker: Mutex<Option<oneshot::Sender<()>>>,
     pub questions: Mutex<HashMap<String, oneshot::Sender<String>>>,
+    /// Set while `run_loop` is sleeping out a provider rate-limit. The
+    /// snapshot reads this so the UI can draw a countdown; clearing it
+    /// is the cooldown-finished signal.
+    pub cooldown: Mutex<Option<super::cooldown::CooldownInfo>>,
+    /// Wake the cooldown sleep early. Filled by `run_loop` right before
+    /// it sleeps; consumed when the user presses Continue mid-cooldown
+    /// instead of waiting out the timer.
+    pub cooldown_skip: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl Inner {
@@ -41,6 +49,8 @@ impl Inner {
             wrap_up_requested: AtomicBool::new(false),
             waker: Mutex::new(None),
             questions: Mutex::new(HashMap::new()),
+            cooldown: Mutex::new(None),
+            cooldown_skip: Mutex::new(None),
         }
     }
 

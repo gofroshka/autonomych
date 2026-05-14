@@ -79,7 +79,52 @@ pub async fn rename_project(
     name: String,
     idea: String,
 ) -> AppResult<()> {
-    state.store.rename_project(&id, &name, &idea)
+    state.store.rename_project(&id, &name, &idea)?;
+    if let Some(c) = state.conductors.lock().await.get(&id) {
+        if let Some(p) = state.store.get_project(&id) {
+            c.refresh_project(p);
+        }
+    }
+    Ok(())
+}
+
+/// Update the project's CLI / models / permission mode. Blocked while a
+/// run is in flight — the rest of the iteration would mix old and new
+/// values otherwise. If a conductor is parked (Idle / Presenting / Error),
+/// hot-swap its cached `ProjectRow` so the next iteration picks them up.
+#[tauri::command]
+pub async fn update_project_settings(
+    state: State<'_, AppState>,
+    id: String,
+    model_pm: String,
+    model_specialist: String,
+    permission_mode: PermissionMode,
+    agent_backend: AgentBackend,
+) -> AppResult<ProjectRow> {
+    if let Some(p) = state.store.get_project(&id) {
+        match p.state {
+            ConductorState::Running
+            | ConductorState::WrappingUp
+            | ConductorState::Resuming
+            | ConductorState::PreparingPreview => {
+                return Err(AppError::Other(
+                    "проект сейчас работает — настройки можно менять после остановки".into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    let updated = state.store.update_project_settings(
+        &id,
+        &model_pm,
+        &model_specialist,
+        permission_mode,
+        agent_backend,
+    )?;
+    if let Some(c) = state.conductors.lock().await.get(&id) {
+        c.refresh_project(updated.clone());
+    }
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -112,18 +157,24 @@ pub async fn get_snapshot(
         .as_ref()
         .map(|p| state.store.pending_questions(&p.id))
         .unwrap_or_default();
-    let preview = {
+    let (preview, cooldown) = {
         let g = state.conductors.lock().await;
         if let Some(c) = g.get(&project_id) {
-            c.preview.lock().await.status()
+            (c.preview.lock().await.status(), c.cooldown_info())
         } else {
-            PreviewStatus {
-                instructions: None,
-                prepared_at: None,
-                prep_error: None,
-            }
+            (
+                PreviewStatus {
+                    instructions: None,
+                    prepared_at: None,
+                    prep_error: None,
+                },
+                None,
+            )
         }
     };
+    // Snapshot only the items PO/UI cares about (active + recently closed
+    // last few). Full archive comes through the dedicated list_backlog cmd.
+    let backlog = state.store.active_backlog(&project_id);
     Ok(DashboardSnapshot {
         project,
         iteration,
@@ -132,6 +183,8 @@ pub async fn get_snapshot(
         pending_steering,
         pending_questions,
         preview,
+        cooldown,
+        backlog,
     })
 }
 
@@ -150,6 +203,12 @@ pub async fn start_conductor(
     project_id: String,
 ) -> AppResult<()> {
     let c = state.get_or_create(&project_id).await?;
+    // If we're currently sleeping out a provider cooldown, the user
+    // pressing Start means "продолжить сейчас" — wake the existing
+    // run_loop instead of spinning up a competing one.
+    if c.skip_cooldown() {
+        return Ok(());
+    }
     c.start().await
 }
 
@@ -184,6 +243,31 @@ pub async fn request_wrap_up(
     Ok(())
 }
 
+/// Queue a steering message for the next iteration's PO without waking any
+/// parked conductor. Used from the dashboard when the user wants to give
+/// initial direction *before* pressing Start, or in the Idle state more
+/// generally. `resume` also pushes steering as a side-effect, but it
+/// additionally fires the resume waker — which is wrong when we're not
+/// already in Presenting.
+#[tauri::command]
+pub async fn push_steering(
+    state: State<'_, AppState>,
+    project_id: String,
+    message: String,
+    mode: String,
+) -> AppResult<()> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let m = match mode.as_str() {
+        "override" => SteeringMode::Override,
+        _ => SteeringMode::Soft,
+    };
+    state.store.push_steering(&project_id, trimmed, m)?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn resume(
     state: State<'_, AppState>,
@@ -212,6 +296,22 @@ pub async fn stop_preview(_state: State<'_, AppState>, _project_id: String) -> A
     // when the conductor is fully stopped. Kept as a callable command so the
     // frontend's existing call sites compile.
     Ok(())
+}
+
+#[tauri::command]
+pub async fn presenter_chat(
+    state: State<'_, AppState>,
+    project_id: String,
+    text: String,
+) -> AppResult<PresenterChatReply> {
+    let c = state
+        .conductors
+        .lock()
+        .await
+        .get(&project_id)
+        .cloned()
+        .ok_or_else(|| AppError::ProjectNotFound(project_id.clone()))?;
+    c.presenter_chat(text).await
 }
 
 #[tauri::command]
@@ -325,6 +425,7 @@ pub async fn send_chat_message(
         max_turns: 8,
         claude_code_preset: true,
         cancel: None,
+        backend: project.agent_backend,
     };
     let answer_text = match crate::agents::run_agent(inv, |_| {}).await {
         Ok(r) => {
@@ -378,4 +479,63 @@ pub async fn open_external(app: AppHandle, path: String) -> AppResult<()> {
         let _ = app.opener().open_path(&path, None::<&str>);
     }
     Ok(())
+}
+
+// ---- Backlog ----
+
+/// Full backlog including done/dismissed history. The dashboard snapshot
+/// only carries active items — UI can fetch the whole archive on demand
+/// (e.g. when the user opens a "show all" view).
+#[tauri::command]
+pub async fn list_backlog(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> AppResult<Vec<BacklogItem>> {
+    Ok(state.store.list_backlog(&project_id))
+}
+
+#[tauri::command]
+pub async fn add_backlog_item(
+    state: State<'_, AppState>,
+    project_id: String,
+    title: String,
+    details: Option<String>,
+    category: Option<BacklogCategory>,
+    priority: Option<BacklogPriority>,
+) -> AppResult<BacklogItem> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Other("заголовок не может быть пустым".into()));
+    }
+    state.store.add_backlog(
+        &project_id,
+        NewBacklogItem {
+            title: trimmed.into(),
+            details: details.unwrap_or_default(),
+            source: BacklogSource::UserSteering,
+            category: category.unwrap_or_default(),
+            priority: priority.unwrap_or_default(),
+            origin_iteration_id: None,
+            origin_task_id: None,
+        },
+    )
+}
+
+#[tauri::command]
+pub async fn update_backlog_item(
+    state: State<'_, AppState>,
+    id: String,
+    title: Option<String>,
+    details: Option<String>,
+    priority: Option<BacklogPriority>,
+) -> AppResult<()> {
+    state.store.update_backlog(&id, title, details, priority)
+}
+
+#[tauri::command]
+pub async fn dismiss_backlog_item(
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<()> {
+    state.store.dismiss_backlog(&id)
 }

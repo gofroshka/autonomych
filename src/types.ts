@@ -8,6 +8,7 @@ export type ConductorState =
   | "PREPARING_PREVIEW"
   | "PRESENTING"
   | "RESUMING"
+  | "PAUSED"
   | "ERROR";
 
 export type AgentRole =
@@ -34,6 +35,10 @@ export type IterationStatus =
 
 export type PermissionMode = "default" | "acceptEdits" | "bypassPermissions";
 
+/** Which agent CLI to spawn for this project's roles. `claude_code` is
+ *  Claude Code; `codex` is OpenAI Codex CLI. Decided at project creation. */
+export type AgentBackend = "claude_code" | "codex";
+
 export type IterationMode = "normal" | "wrapup";
 
 export interface ProjectRow {
@@ -46,6 +51,9 @@ export interface ProjectRow {
   model_pm: string;
   model_specialist: string;
   permission_mode: PermissionMode;
+  /** Defaults to `claude_code` for pre-existing projects stored before the
+   *  Codex backend existed. */
+  agent_backend?: AgentBackend;
 }
 
 export interface IterationStory {
@@ -161,7 +169,11 @@ export type EventPayload =
   // Loop / runtime errors
   | { type: "backoff"; duration_ms: number; consecutive: number }
   | { type: "too_many_failures"; consecutive: number }
-  | { type: "loop_error"; error: string };
+  | { type: "loop_error"; error: string }
+  // Provider rate-limit cooldown
+  | { type: "cooldown_started"; retry_at_ms: number; reason: string }
+  | { type: "cooldown_ended"; skipped_by_user: boolean }
+  | { type: "cooldown_cancelled" };
 
 export type EventType = EventPayload["type"];
 
@@ -223,6 +235,49 @@ export interface PreviewStatus {
   prep_error: string | null;
 }
 
+// ===========================================================================
+// Backlog — see src-tauri/src/types.rs for the canonical definitions.
+// ===========================================================================
+
+export type BacklogStatus = "pending" | "in_iteration" | "done" | "dismissed";
+
+export type BacklogSource =
+  | "user_steering"
+  | "reviewer_risk"
+  | "failed_task"
+  | "skipped_task"
+  | "presenter_bug"
+  | "po_carryover";
+
+export type BacklogPriority = "high" | "normal" | "low";
+
+export type BacklogCategory = "critical" | "bug" | "tech_debt" | "feature" | "wish";
+
+export interface BacklogItem {
+  id: string;
+  project_id: string;
+  title: string;
+  details: string;
+  source: BacklogSource;
+  category: BacklogCategory;
+  priority: BacklogPriority;
+  status: BacklogStatus;
+  created_at: number;
+  picked_in_iteration_id?: string;
+  origin_iteration_id?: string;
+  origin_task_id?: string;
+  completed_at?: number;
+}
+
+export interface CooldownInfo {
+  /** Unix-ms when the conductor plans to resume the paused iteration. */
+  retry_at_ms: number;
+  /** Truncated original agent error that triggered the cooldown. */
+  reason: string;
+  /** Iteration this cooldown is attached to. */
+  iteration_id?: string;
+}
+
 export interface DashboardSnapshot {
   project: ProjectRow | null;
   iteration: IterationRow | null;
@@ -231,6 +286,10 @@ export interface DashboardSnapshot {
   pending_steering: SteeringRow | null;
   pending_questions: QuestionRow[];
   preview: PreviewStatus;
+  /** Non-null while the conductor is sleeping out a rate-limit cooldown. */
+  cooldown?: CooldownInfo | null;
+  /** Pending + currently-in-iteration backlog items for the project. */
+  backlog?: BacklogItem[];
 }
 
 export interface CreateProjectInput {
@@ -240,6 +299,15 @@ export interface CreateProjectInput {
   model_pm?: string;
   model_specialist?: string;
   permission_mode?: PermissionMode;
+  agent_backend?: AgentBackend;
+}
+
+/** Reply from the Presenter agent's mid-demo chat triage. `reply` is the
+ *  markdown for the user; `draft_steering` (when set) is a pre-filled
+ *  steering suggestion when the agent decided the issue is a code bug. */
+export interface PresenterChatReply {
+  reply: string;
+  draft_steering: string | null;
 }
 
 export interface HistoryEntry {

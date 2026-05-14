@@ -141,6 +141,7 @@ impl Conductor {
                 max_turns: 80,
                 claude_code_preset: true,
                 cancel: Some(self.cancel_token()),
+                backend: project.agent_backend,
             };
             let publisher = self.event_publisher();
             let iter_id_s = iter.id.clone();
@@ -426,6 +427,7 @@ impl Conductor {
             max_turns: 30,
             claude_code_preset: true,
             cancel: Some(self.cancel_token()),
+            backend: project.agent_backend,
         };
         let publisher = self.event_publisher();
         let iter_id = iter.id.clone();
@@ -479,6 +481,7 @@ impl Conductor {
             max_turns: 3,
             claude_code_preset: false,
             cancel: Some(self.cancel_token()),
+            backend: project.agent_backend,
         };
         let publisher = self.event_publisher();
         let iter_id = iter.id.clone();

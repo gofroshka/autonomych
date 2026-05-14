@@ -13,6 +13,7 @@ import { StateBadge } from "./components/StateBadge";
 import { QuestionModal } from "./components/QuestionModal";
 import { DeleteProjectModal } from "./components/DeleteProjectModal";
 import { RenameProjectModal } from "./components/RenameProjectModal";
+import { ProjectSettingsModal } from "./components/ProjectSettingsModal";
 import { HistoryDialog } from "./components/HistoryDialog";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { Button } from "./components/ui/button";
@@ -27,6 +28,7 @@ export function App() {
   const [creating, setCreating] = useState(false);
   const [deletingProject, setDeletingProject] = useState<ProjectRow | null>(null);
   const [renamingProject, setRenamingProject] = useState<ProjectRow | null>(null);
+  const [settingsProject, setSettingsProject] = useState<ProjectRow | null>(null);
   const [showHistory, setShowHistory] = useState(false);
   const [leftCollapsed, setLeftCollapsed] = useState(false);
   const [rightCollapsed, setRightCollapsed] = useState(false);
@@ -78,6 +80,7 @@ export function App() {
               onNew={() => setCreating(true)}
               onDelete={setDeletingProject}
               onRename={setRenamingProject}
+              onSettings={setSettingsProject}
             />
           )}
 
@@ -90,18 +93,28 @@ export function App() {
               onStop={app.stop}
               onWrapUp={app.wrapUp}
               onEditProject={() => activeProject && setRenamingProject(activeProject)}
+              onSettings={() => activeProject && setSettingsProject(activeProject)}
               onShowHistory={() => setShowHistory(true)}
+              onBacklogChanged={() => activeId && app.refreshSnapshot(activeId)}
             />
             {showPresenting && activeProject && (
               <PresentingOverlay
                 project={activeProject}
                 snapshot={snapshot}
                 onResume={app.resume}
+                onBacklogChanged={() => activeId && app.refreshSnapshot(activeId)}
               />
             )}
           </section>
 
-          {!rightCollapsed && <RightPanel events={events} project={activeProject} />}
+          {!rightCollapsed && (
+            <RightPanel
+              events={events}
+              project={activeProject}
+              backlog={snapshot?.backlog ?? []}
+              onBacklogChanged={() => activeId && app.refreshSnapshot(activeId)}
+            />
+          )}
         </main>
 
         {creating && (
@@ -131,6 +144,16 @@ export function App() {
             onClose={() => setRenamingProject(null)}
             onSave={async (name, idea) => {
               await app.renameProject(renamingProject.id, name, idea);
+            }}
+          />
+        )}
+
+        {settingsProject && (
+          <ProjectSettingsModal
+            project={settingsProject}
+            onClose={() => setSettingsProject(null)}
+            onSave={async (s) => {
+              await app.updateProjectSettings(settingsProject.id, s);
             }}
           />
         )}

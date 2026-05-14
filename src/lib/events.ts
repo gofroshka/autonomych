@@ -18,6 +18,9 @@ export const STRUCTURAL_EVENTS = new Set<EventType>([
   "agent_error",
   "question_asked",
   "question_answered",
+  "cooldown_started",
+  "cooldown_ended",
+  "cooldown_cancelled",
 ]);
 
 export function isStructural(payload: EventPayload): boolean {

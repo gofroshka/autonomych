@@ -59,9 +59,11 @@ impl Conductor {
                 Some(iter.id.clone()),
                 None,
             );
-        } else if let Some(s) = self.store.pending_steering(&project.id) {
-            let _ = self.store.consume_steering(&s.id, &iter.id);
         }
+        // Steering is *not* consumed here. `run_po_stage` reads it and marks
+        // it consumed only after the PO actually has the steering in its
+        // prompt — consuming early left the iteration with no steering at
+        // all, because `pending_steering` filters out applied rows.
 
         let project_context = snapshot_project_files(&PathBuf::from(&project.root_path)).await;
 
@@ -76,10 +78,28 @@ impl Conductor {
         self.clone()
             .execute_specialist_waves(&arch_output.tasks, &iter, &project)
             .await;
+        // Wave runner exits cleanly on cancel and swallows errors. Without
+        // this guard a user-Stop mid-specialist-phase would silently sail
+        // past Reviewer/Documenter, both of which also swallow their own
+        // errors, and the iteration would get marked Completed with an
+        // empty summary — making it unresumable on the next Start.
+        if self.is_cancelled() {
+            return Err(AppError::Conductor(
+                "iteration cancelled mid-specialist-phase".into(),
+            ));
+        }
 
         let reviewer = self
             .run_reviewer_stage(&project, &iter, &po_output, mode_is_wrapup)
             .await;
+        // run_reviewer_stage maps errors to `None`. Distinguish "reviewer
+        // genuinely had nothing to say" from "user pressed Stop while
+        // reviewer was running" by checking the cancel token directly.
+        if self.is_cancelled() {
+            return Err(AppError::Conductor(
+                "iteration cancelled during reviewer".into(),
+            ));
+        }
 
         // Documenter is best-effort: a failure here doesn't fail the
         // iteration. Worst case the docs lag one iteration behind.
@@ -88,6 +108,11 @@ impl Conductor {
             .await
         {
             tracing::warn!(error = %e, "documenter stage failed — docs may be stale");
+        }
+        if self.is_cancelled() {
+            return Err(AppError::Conductor(
+                "iteration cancelled after documenter".into(),
+            ));
         }
 
         let summary = match &reviewer {
@@ -104,6 +129,36 @@ impl Conductor {
             ),
             None => format!("Итерация #{}: ревью не получено", iter.number),
         };
+        // Auto-populate the backlog from this iteration's tail end:
+        //   - Failed tasks → re-attempt material (one item per task, dedup by
+        //     `origin_task_id` so a re-run of the same task doesn't fan out).
+        //   - Skipped-because-dep-failed → not added: those are cascade
+        //     effects, not architectural debt; once the root cause is fixed
+        //     they get scheduled normally.
+        // Then revert any backlog items the Reviewer didn't close — they
+        // stay Pending, visible in the next iteration's PO prompt.
+        let tail_tasks = self.store.iteration_tasks(&iter.id);
+        for t in tail_tasks.iter().filter(|t| matches!(t.status, TaskStatus::Failed)) {
+            let _ = self.store.add_backlog_for_task_if_missing(
+                &project.id,
+                NewBacklogItem {
+                    title: format!("Re-attempt: {}", t.title),
+                    details: format!(
+                        "Task упал в итерации #{}.\nРоль: {:?}\nОписание исходной задачи: {}",
+                        iter.number, t.role, t.description
+                    ),
+                    source: BacklogSource::FailedTask,
+                    category: BacklogCategory::Bug,
+                    priority: BacklogPriority::High,
+                    origin_iteration_id: Some(iter.id.clone()),
+                    origin_task_id: Some(t.id.clone()),
+                },
+            );
+        }
+        if let Err(e) = self.store.revert_backlog_for_iteration(&iter.id) {
+            tracing::warn!(error = %e, "could not revert backlog after iteration");
+        }
+
         let final_status = if mode_is_wrapup {
             IterationStatus::Presented
         } else {
@@ -143,13 +198,22 @@ impl Conductor {
                 iteration_theme: theme,
                 rationale: iter.rationale.clone().unwrap_or_default(),
                 stories: iter.stories.clone(),
+                picked_backlog_ids: vec![],
+                add_to_backlog: vec![],
             });
         }
 
-        let steering = self.store.pending_steering(&project.id);
+        // Steering rows are no longer injected directly into the PO prompt.
+        // The user-driven input flow goes entirely through the backlog now —
+        // adding an item with a category (bug/critical/feature/wish/...) and
+        // letting PO honour its own prioritisation rules ("fix bugs first").
+        // SteeringRow storage remains for backward compat with old projects
+        // but isn't consulted here anymore.
         let history = build_history_summary(&self.store, &project.id);
+        let backlog = self.store.active_backlog(&project.id);
+        let backlog_section = format_backlog_for_po(&backlog);
         let po_prompt = format!(
-            "Идея проекта: {}\nИмя проекта: {}\n\nТекущая итерация: #{} (mode={})\n\n--- История последних итераций ---\n{}\n\n--- Снапшот файлов проекта ---\n{}\n\n{}\nВерни строго JSON по описанному формату.",
+            "Идея проекта: {}\nИмя проекта: {}\n\nТекущая итерация: #{} (mode={})\n\n--- История последних итераций ---\n{}\n\n--- BACKLOG ---\n{}\n\n--- Снапшот файлов проекта ---\n{}\n\nВерни строго JSON по описанному формату.",
             project.idea,
             project.name,
             iter.number,
@@ -159,15 +223,12 @@ impl Conductor {
             } else {
                 history
             },
+            backlog_section,
             if project_context.is_empty() {
                 "(пусто, проект ещё не создан)".into()
             } else {
                 project_context.to_string()
-            },
-            steering
-                .as_ref()
-                .map(|s| format!("--- USER_STEERING ({:?}) ---\n{}\n", s.mode, s.message))
-                .unwrap_or_default()
+            }
         );
         let raw = self
             .run_json_agent(AgentRole::ProductOwner, mode_is_wrapup, po_prompt, project, iter)
@@ -176,6 +237,8 @@ impl Conductor {
             iteration_theme: "(без темы)".into(),
             rationale: String::new(),
             stories: vec![],
+            picked_backlog_ids: vec![],
+            add_to_backlog: vec![],
         });
         self.store.set_iteration_meta(
             &iter.id,
@@ -185,6 +248,40 @@ impl Conductor {
             None,
             None,
         )?;
+        // Filter PO's `picked_backlog_ids` to the set we actually showed it,
+        // then mark those rows as InIteration. Anything else is ignored —
+        // PO might hallucinate ids and we don't want to silently create
+        // orphan state.
+        let valid_picks: Vec<String> = {
+            let active_ids: std::collections::HashSet<&str> =
+                backlog.iter().map(|b| b.id.as_str()).collect();
+            parsed
+                .picked_backlog_ids
+                .iter()
+                .filter(|id| active_ids.contains(id.as_str()))
+                .cloned()
+                .collect()
+        };
+        if !valid_picks.is_empty() {
+            if let Err(e) = self.store.pick_backlog(&valid_picks, &iter.id) {
+                tracing::warn!(error = %e, "po: pick_backlog failed");
+            }
+        }
+        // PO's parking-lot proposals — created as fresh Pending items.
+        for prop in &parsed.add_to_backlog {
+            let _ = self.store.add_backlog(
+                &project.id,
+                NewBacklogItem {
+                    title: prop.title.clone(),
+                    details: prop.details.clone(),
+                    source: BacklogSource::PoCarryover,
+                    category: prop.category,
+                    priority: prop.priority,
+                    origin_iteration_id: Some(iter.id.clone()),
+                    origin_task_id: None,
+                },
+            );
+        }
         self.emit_for(
             EventPayload::PoDone {
                 theme: parsed.iteration_theme.clone(),
@@ -317,12 +414,31 @@ impl Conductor {
             .map(|r| format!("- [{:?}] {:?}: {}", r.status, r.role, r.title))
             .collect::<Vec<_>>()
             .join("\n");
+        // Backlog items PO picked into this iteration — Reviewer needs to
+        // know which to consider for closure. Format compactly with ids
+        // so the LLM can reference them in `closed_backlog_ids`.
+        let in_iteration_backlog: Vec<_> = self
+            .store
+            .list_backlog(&project.id)
+            .into_iter()
+            .filter(|b| {
+                b.picked_in_iteration_id.as_deref() == Some(&iter.id)
+                    && matches!(b.status, BacklogStatus::InIteration)
+            })
+            .collect();
+        let backlog_section = format_backlog_for_reviewer(&in_iteration_backlog);
+
         let reviewer_prompt = format!(
-            "Итерация #{}. Тема: {}\nStories:\n{}\n\nВыполненные задачи:\n{}\n\nКорень проекта: {}. Ты можешь читать файлы и запускать команды.\nСделай проверку и верни строго JSON.",
-            iter.number, po_output.iteration_theme, stories_list, tasks_list, project.root_path
+            "Итерация #{}. Тема: {}\nStories:\n{}\n\nВыполненные задачи:\n{}\n\n--- BACKLOG_IN_ITERATION ---\n{}\n\nКорень проекта: {}. Ты можешь читать файлы и запускать команды.\nСделай проверку и верни строго JSON.",
+            iter.number,
+            po_output.iteration_theme,
+            stories_list,
+            tasks_list,
+            backlog_section,
+            project.root_path
         );
 
-        match self
+        let parsed = match self
             .run_json_agent(AgentRole::Reviewer, mode_is_wrapup, reviewer_prompt, project, iter)
             .await
         {
@@ -337,7 +453,41 @@ impl Conductor {
                 );
                 None
             }
+        };
+
+        // Apply backlog side-effects from the reviewer's verdict.
+        if let Some(out) = parsed.as_ref() {
+            let picked_ids: std::collections::HashSet<&str> = in_iteration_backlog
+                .iter()
+                .map(|b| b.id.as_str())
+                .collect();
+            let valid_closures: Vec<String> = out
+                .closed_backlog_ids
+                .iter()
+                .filter(|id| picked_ids.contains(id.as_str()))
+                .cloned()
+                .collect();
+            if !valid_closures.is_empty() {
+                if let Err(e) = self.store.close_backlog(&valid_closures) {
+                    tracing::warn!(error = %e, "reviewer: close_backlog failed");
+                }
+            }
+            for prop in &out.add_to_backlog {
+                let _ = self.store.add_backlog(
+                    &project.id,
+                    NewBacklogItem {
+                        title: prop.title.clone(),
+                        details: prop.details.clone(),
+                        source: BacklogSource::ReviewerRisk,
+                        category: prop.category,
+                        priority: prop.priority,
+                        origin_iteration_id: Some(iter.id.clone()),
+                        origin_task_id: None,
+                    },
+                );
+            }
         }
+        parsed
     }
 
     /// Maintain the project's living documentation. Runs after the Reviewer
@@ -407,6 +557,7 @@ impl Conductor {
             max_turns: 30,
             claude_code_preset: true,
             cancel: Some(self.cancel_token()),
+            backend: project.agent_backend,
         };
         let publisher = self.event_publisher();
         let iter_id = iter.id.clone();
@@ -469,6 +620,7 @@ impl Conductor {
                 AgentRole::Reviewer | AgentRole::ProductOwner | AgentRole::Architect
             ),
             cancel: Some(self.cancel_token()),
+            backend: project.agent_backend,
         };
         let publisher = self.event_publisher();
         let iter_id = iter.id.clone();
@@ -497,18 +649,268 @@ async fn snapshot_project_files(root: &Path) -> String {
 }
 
 fn build_history_summary(store: &Store, project_id: &str) -> String {
-    store
+    let iters: Vec<_> = store
         .recent_iterations(project_id, HISTORY_DEPTH)
         .into_iter()
         .filter(|i| i.summary.is_some())
+        .collect();
+    if iters.is_empty() {
+        return String::new();
+    }
+
+    let themes: Vec<&str> = iters
+        .iter()
+        .filter_map(|i| i.theme.as_deref())
+        .collect();
+    let loop_warning = detect_repeating_theme(&themes);
+
+    let body = iters
+        .iter()
         .map(|i| {
+            let tasks = store.iteration_tasks(&i.id);
+            let task_summary = if tasks.is_empty() {
+                String::new()
+            } else {
+                let total = tasks.len();
+                let done = tasks
+                    .iter()
+                    .filter(|t| matches!(t.status, TaskStatus::Done))
+                    .count();
+                let failed = tasks
+                    .iter()
+                    .filter(|t| matches!(t.status, TaskStatus::Failed))
+                    .count();
+                let skipped = tasks
+                    .iter()
+                    .filter(|t| matches!(t.status, TaskStatus::Skipped))
+                    .count();
+                let pending = tasks
+                    .iter()
+                    .filter(|t| {
+                        matches!(t.status, TaskStatus::Pending | TaskStatus::InProgress)
+                    })
+                    .count();
+                let problem_tasks: Vec<String> = tasks
+                    .iter()
+                    .filter(|t| {
+                        matches!(
+                            t.status,
+                            TaskStatus::Failed | TaskStatus::Skipped | TaskStatus::Pending
+                        )
+                    })
+                    .map(|t| format!("  - [{:?}] {:?}: {}", t.status, t.role, t.title))
+                    .collect();
+                let mut s = format!(
+                    "\nТаски: {done}/{total} done, {failed} failed, {skipped} skipped, {pending} pending"
+                );
+                if !problem_tasks.is_empty() {
+                    s.push_str("\nНезакрытые:\n");
+                    s.push_str(&problem_tasks.join("\n"));
+                }
+                s
+            };
             format!(
-                "### Итерация #{} [{:?}]\n{}",
+                "### Итерация #{} [{:?}]\n{}{}",
                 i.number,
                 i.status,
-                i.summary.unwrap_or_default()
+                i.summary.clone().unwrap_or_default(),
+                task_summary,
             )
         })
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n\n");
+
+    match loop_warning {
+        Some(msg) => format!(
+            "⚠️ ВНИМАНИЕ — ВОЗМОЖНАЯ ПЕТЛЯ: {msg}.\n\
+             Даже если итерации помечены ✓, повторение темы — сигнал что подход не работает \
+             либо ты циклишь. НЕ выбирай эту же тему снова. Переключись на другую область проекта, \
+             удали проблемную фичу, или поставь ASK_USER. См. секцию «Защита от петель» в системном промпте.\n\n\
+             ---\n\n{body}"
+        ),
+        None => body,
+    }
+}
+
+/// Compact backlog rendering for PO's prompt, grouped by category so the
+/// prioritisation rule ("close critical+bug before features") is obvious
+/// at a glance. Items are already sorted by `active_backlog` (category,
+/// priority, recency).
+fn format_backlog_for_po(items: &[BacklogItem]) -> String {
+    if items.is_empty() {
+        return "(беклог пуст — это первая итерация или всё закрыто; можешь предложить story сам из идеи проекта)".into();
+    }
+
+    let category_label = |c: BacklogCategory| match c {
+        BacklogCategory::Critical => "🚨 CRITICAL — БЛОКЕРЫ (фиксить в первую очередь, ничего другого не брать)",
+        BacklogCategory::Bug => "🐛 BUG — известные баги (брать после critical, перед фичами)",
+        BacklogCategory::TechDebt => "🔧 TECH_DEBT — техдолг и риски",
+        BacklogCategory::Feature => "✨ FEATURE — новый функционал",
+        BacklogCategory::Wish => "💭 WISH — пожелания / nice-to-have",
+    };
+
+    // Sweep through pre-sorted items and emit a heading every time category
+    // changes — preserves the priority order while making it readable.
+    let mut out = String::new();
+    let mut current: Option<BacklogCategory> = None;
+    for b in items {
+        if current != Some(b.category) {
+            if current.is_some() {
+                out.push('\n');
+            }
+            out.push_str("\n## ");
+            out.push_str(category_label(b.category));
+            out.push('\n');
+            current = Some(b.category);
+        }
+        let status_tag = match b.status {
+            BacklogStatus::InIteration => " [уже взят в эту итерацию]",
+            _ => "",
+        };
+        let details_line = if b.details.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n  details: {}",
+                b.details.chars().take(240).collect::<String>()
+            )
+        };
+        out.push_str(&format!(
+            "[{}] ({:?}, src={:?}) {}{}{}\n",
+            b.id, b.priority, b.source, b.title, status_tag, details_line
+        ));
+    }
+    out
+}
+
+/// Backlog view for the Reviewer — only the items PO picked into the
+/// current iteration. Reviewer references these ids in `closed_backlog_ids`.
+fn format_backlog_for_reviewer(items: &[BacklogItem]) -> String {
+    if items.is_empty() {
+        return "(PO не выбрал ни одного backlog-айтема в эту итерацию — оцени только по stories выше)".into();
+    }
+    items
+        .iter()
+        .map(|b| {
+            let details_line = if b.details.trim().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n  details: {}",
+                    b.details.chars().take(240).collect::<String>()
+                )
+            };
+            format!(
+                "[{}] ({:?}, src={:?}) {}{}",
+                b.id, b.category, b.source, b.title, details_line
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Naive heuristic: count which lowercased word-tokens (length > 4, excluding
+/// a small stoplist) appear in 3+ of the last N iteration themes. If any
+/// content-bearing word repeats that often, we treat the project as stuck
+/// in a loop and surface a warning to PO. Returns a short human-readable
+/// description for the warning message, or None when no repetition was found.
+fn detect_repeating_theme(themes: &[&str]) -> Option<String> {
+    if themes.len() < 3 {
+        return None;
+    }
+    // Generic words that are everywhere in iteration themes and would
+    // produce false positives.
+    const STOPWORDS: &[&str] = &[
+        "фикс", "фикса", "фиксы", "фикси", "фиксинг",
+        "доводка", "доделка", "доделки", "доделать",
+        "итерация", "итерации",
+        "система", "системы", "системе", "систему",
+        "часть", "часта",
+        "новая", "новый", "новое", "новые",
+        "проект", "проекта", "проекте",
+        "обновить", "обновление",
+        "довести", "докрутить",
+        "полный", "полная", "полное", "полные",
+        "общая", "общий", "общее", "общие",
+        "поддержка", "поддержки",
+        "обработка", "обработки",
+        "минимальный", "минимальная",
+        "стабильность", "стабильности",
+        "fix", "fixing", "fixes",
+        "iteration",
+        "feature", "features",
+        "system", "systems",
+        "project",
+        "support",
+        "improve", "improvement", "improvements",
+        "general", "minor",
+    ];
+    let token_sets: Vec<std::collections::HashSet<String>> = themes
+        .iter()
+        .map(|t| {
+            t.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .map(|w| w.to_lowercase())
+                .filter(|w| w.chars().count() > 4 && !STOPWORDS.contains(&w.as_str()))
+                .collect()
+        })
+        .collect();
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for set in &token_sets {
+        for w in set {
+            *counts.entry(w.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, c)| *c >= 3)
+        .max_by_key(|(_, c)| *c)
+        .map(|(w, c)| format!("«{w}» встречается в {c} из последних {} итераций", themes.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_repeating_theme;
+
+    #[test]
+    fn detects_repeated_keyword() {
+        let themes = vec![
+            "Гарантированный фикс is_active в схеме БД",
+            "Фикс is_active: рабочая миграция и entrypoint",
+            "Фикс is_active: синхронизация ORM-модели и схемы БД",
+            "Фикс синхронизации дат + Docker-only демо",
+            "Фикс воркера и стабильность Docker-инфраструктуры",
+        ];
+        let warn = detect_repeating_theme(&themes).expect("loop should be detected");
+        assert!(warn.contains("is_active"));
+    }
+
+    #[test]
+    fn no_loop_when_themes_diverse() {
+        let themes = vec![
+            "MVP: каркас фронта и бэка",
+            "Аутентификация через JWT",
+            "Каталог товаров",
+            "Корзина и checkout",
+            "Админ-панель",
+        ];
+        assert!(detect_repeating_theme(&themes).is_none());
+    }
+
+    #[test]
+    fn stopwords_dont_trigger() {
+        let themes = vec![
+            "Фикс воркера",
+            "Фикс БД",
+            "Фикс системы",
+        ];
+        // «фикс» — стоп-слово, остальные различные → не петля
+        assert!(detect_repeating_theme(&themes).is_none());
+    }
+
+    #[test]
+    fn requires_three_or_more_overlapping() {
+        let themes = vec!["Postgres миграции", "Postgres конфиг"];
+        // только два — не считаем петлёй
+        assert!(detect_repeating_theme(&themes).is_none());
+    }
 }

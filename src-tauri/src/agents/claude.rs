@@ -9,11 +9,11 @@
 //! may evolve it; if a new Claude Code version breaks parsing, update the
 //! `SdkMessage` enum below.
 
+use super::{AgentEvent, AgentInvocation, AgentResult};
 use crate::error::{AppError, AppResult};
-use crate::types::{AgentRole, PermissionMode};
-use serde::{Deserialize, Serialize};
+use crate::types::PermissionMode;
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -36,47 +36,6 @@ const SILENCE_WARN_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 /// the background for self-verification) which is holding the stdout pipe
 /// open and would otherwise hang us forever.
 const POST_RESULT_GRACE: Duration = Duration::from_secs(3);
-
-#[derive(Debug, Clone)]
-pub struct AgentInvocation {
-    pub role: AgentRole,
-    pub system_prompt: String,
-    pub user_prompt: String,
-    pub cwd: PathBuf,
-    pub model: String,
-    pub tools: Vec<String>,
-    pub permission_mode: PermissionMode,
-    pub max_turns: u32,
-    /// When true, base on the claude_code system preset (file edits etc).
-    /// When false, the system prompt is replaced entirely.
-    pub claude_code_preset: bool,
-    /// Cancellation token. When the conductor signals stop, every running
-    /// agent observes the cancellation and kills its `claude` subprocess.
-    pub cancel: Option<CancellationToken>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind")]
-pub enum AgentEvent {
-    Start { role: AgentRole },
-    AssistantText { role: AgentRole, text: String },
-    ToolUse { role: AgentRole, tool: String, input: Value },
-    ToolResult { role: AgentRole, content: String, is_error: bool },
-    End { role: AgentRole, final_text: String, turns: u32, duration_ms: u64 },
-    AgentError { role: AgentRole, message: String },
-}
-
-/// Final result of an agent invocation. `turns` and `duration_ms` are exposed
-/// alongside the text so callers can log them; the running tally is also
-/// emitted through `AgentEvent::End`.
-#[derive(Debug)]
-pub struct AgentResult {
-    pub final_text: String,
-    #[allow(dead_code)]
-    pub turns: u32,
-    #[allow(dead_code)]
-    pub duration_ms: u64,
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
@@ -151,12 +110,17 @@ fn permission_arg(mode: PermissionMode) -> &'static str {
     }
 }
 
-/// Run the agent to completion. Streams events through `on_event`.
+/// Run an agent under Claude Code CLI to completion. Streams events through
+/// `on_event`. Dispatched to from `agents::run_agent` based on
+/// `inv.backend == AgentBackend::ClaudeCode`.
 #[tracing::instrument(
     skip(inv, on_event),
     fields(role = ?inv.role, model = %inv.model, cwd = %inv.cwd.display()),
 )]
-pub async fn run_agent<F>(inv: AgentInvocation, mut on_event: F) -> AppResult<AgentResult>
+pub(super) async fn run_claude_agent<F>(
+    inv: AgentInvocation,
+    mut on_event: F,
+) -> AppResult<AgentResult>
 where
     F: FnMut(AgentEvent) + Send,
 {

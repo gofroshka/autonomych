@@ -1,34 +1,36 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ChevronDown, FolderOpen } from "lucide-react";
 import { api } from "../lib/api";
-import type { CreateProjectInput, PermissionMode } from "../types";
+import type { AgentBackend, CreateProjectInput, PermissionMode } from "../types";
 import { Button } from "./ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "./ui/dialog";
 import { Input, Label, Textarea } from "./ui/input";
 import { cn } from "../lib/cn";
+import { BACKEND_DEFAULTS, modelsFor, type ModelSuggestion } from "../lib/agent-models";
 
 interface Props {
   onClose: () => void;
   onCreate: (input: CreateProjectInput) => void;
 }
 
-/** CLI-resolved aliases — always point to the latest model in each family.
- *  No version pinning, no maintenance burden on us when Anthropic ships
- *  a new revision. */
-const MODELS: ReadonlyArray<{ id: string; label: string; hint: string }> = [
-  { id: "opus", label: "Opus", hint: "самая умная и дорогая" },
-  { id: "sonnet", label: "Sonnet", hint: "баланс цена/качество" },
-  { id: "haiku", label: "Haiku", hint: "быстрая и дешёвая" },
-];
-
 export function CreateProjectModal({ onClose, onCreate }: Props) {
   const [name, setName] = useState("");
   const [idea, setIdea] = useState("");
   const [rootPath, setRootPath] = useState("");
   const [advanced, setAdvanced] = useState(false);
-  const [modelPm, setModelPm] = useState("opus");
-  const [modelSpec, setModelSpec] = useState("sonnet");
+  const [backend, setBackend] = useState<AgentBackend>("claude_code");
+  const [modelPm, setModelPm] = useState(BACKEND_DEFAULTS.claude_code.pm);
+  const [modelSpec, setModelSpec] = useState(BACKEND_DEFAULTS.claude_code.spec);
   const [permMode, setPermMode] = useState<PermissionMode>("bypassPermissions");
+
+  // Когда юзер переключает CLI, дефолтные модели должны автообновиться,
+  // но только если он не успел их вручную поменять под текущий backend.
+  useEffect(() => {
+    setModelPm(BACKEND_DEFAULTS[backend].pm);
+    setModelSpec(BACKEND_DEFAULTS[backend].spec);
+  }, [backend]);
+
+  const models = modelsFor(backend);
 
   const pickDir = async () => {
     const p = await api.pickDirectory();
@@ -67,17 +69,34 @@ export function CreateProjectModal({ onClose, onCreate }: Props) {
           </button>
           {advanced && (
             <div className="space-y-4 border-l-2 border-border pl-4 ml-1">
+              <div className="space-y-1.5">
+                <Label>Агентский CLI</Label>
+                <select
+                  value={backend}
+                  onChange={(e) => setBackend(e.target.value as AgentBackend)}
+                  className="w-full h-9 rounded-md border border-border bg-background px-3 text-sm"
+                >
+                  <option value="claude_code">Claude Code — Anthropic Claude (claude CLI)</option>
+                  <option value="codex">Codex — OpenAI Codex (codex CLI)</option>
+                </select>
+                <p className="text-[11px] text-muted-foreground">
+                  CLI должен быть установлен и авторизован на твоей машине.
+                  Изменить после создания проекта пока нельзя.
+                </p>
+              </div>
               <ModelSelect
                 label="Модель для PM-агентов"
                 hint="PO, Architect, Reviewer, Overseer"
                 value={modelPm}
                 onChange={setModelPm}
+                models={models}
               />
               <ModelSelect
                 label="Модель для специалистов"
                 hint="Backend / Frontend / DevOps / Presenter / Documenter / Merge Resolver"
                 value={modelSpec}
                 onChange={setModelSpec}
+                models={models}
               />
               <div className="space-y-1.5">
                 <Label>Permission mode</Label>
@@ -98,6 +117,7 @@ export function CreateProjectModal({ onClose, onCreate }: Props) {
             onClick={() => onCreate({
               name: name.trim(), idea: idea.trim(), root_path: rootPath.trim(),
               model_pm: modelPm, model_specialist: modelSpec, permission_mode: permMode,
+              agent_backend: backend,
             })}
           >Создать</Button>
         </DialogFooter>
@@ -111,26 +131,34 @@ function ModelSelect({
   hint,
   value,
   onChange,
+  models,
 }: {
   label: string;
   hint?: string;
   value: string;
   onChange: (v: string) => void;
+  models: ReadonlyArray<ModelSuggestion>;
 }) {
+  // free-text input with datalist — works for any model name the CLI accepts,
+  // plus shows the curated suggestions for the current backend.
+  const listId = `models-${label.replace(/\s+/g, "-")}`;
   return (
     <div className="space-y-1.5">
       <Label>{label}</Label>
-      <select
+      <Input
+        list={listId}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full h-9 rounded-md border border-border bg-background px-3 text-sm"
-      >
-        {MODELS.map((m) => (
+        autoComplete="off"
+      />
+      <datalist id={listId}>
+        {models.map((m) => (
           <option key={m.id} value={m.id}>
             {m.label} — {m.hint}
           </option>
         ))}
-      </select>
+      </datalist>
+      {hint && <div className="text-[11px] text-muted-foreground">{hint}</div>}
     </div>
   );
 }
