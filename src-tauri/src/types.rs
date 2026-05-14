@@ -93,6 +93,8 @@ pub enum IterationMode {
 pub struct ProjectRow {
     pub id: String,
     pub name: String,
+    /// Free-form note the user wrote at creation, also seeded into
+    /// `docs/product/vision.md`. Display only — agents read the doc.
     pub idea: String,
     pub root_path: String,
     pub state: ConductorState,
@@ -100,10 +102,6 @@ pub struct ProjectRow {
     pub model_pm: String,
     pub model_specialist: String,
     pub permission_mode: PermissionMode,
-    /// Which agent CLI to use for this project. `#[serde(default)]` keeps
-    /// pre-existing projects (in `projects.json` without this field)
-    /// readable — they default to ClaudeCode.
-    #[serde(default)]
     pub agent_backend: AgentBackend,
 }
 
@@ -131,7 +129,6 @@ pub struct IterationRow {
     pub summary: Option<String>,
     pub theme: Option<String>,
     pub rationale: Option<String>,
-    #[serde(default)]
     pub stories: Vec<IterationStory>,
     pub stack_notes: Option<String>,
     pub mode: Option<IterationMode>,
@@ -150,13 +147,10 @@ pub struct TaskRow {
     pub created_at: i64,
     /// Set when the task first transitions to `InProgress`. Used by the UI
     /// to show a live elapsed timer that reflects actual run time, not the
-    /// architect's row-creation time. `#[serde(default)]` keeps backward
-    /// compat with pre-existing tasks files.
-    #[serde(default)]
+    /// architect's row-creation time.
     pub started_at: Option<i64>,
     pub ended_at: Option<i64>,
     pub architect_id: Option<String>,
-    #[serde(default)]
     pub depends_on: Vec<String>,
 }
 
@@ -172,23 +166,6 @@ pub struct EventRow {
     pub task_id: Option<String>,
     pub agent_role: Option<AgentRole>,
     pub payload: crate::events::EventPayload,
-    pub ts: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SteeringMode {
-    Soft,
-    Override,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SteeringRow {
-    pub id: String,
-    pub project_id: String,
-    pub message: String,
-    pub mode: SteeringMode,
-    pub applied_iteration_id: Option<String>,
     pub ts: i64,
 }
 
@@ -238,7 +215,6 @@ pub struct ChatMessageRow {
     pub role: ChatRole,
     pub text: String,
     pub ts: i64,
-    #[serde(default)]
     pub error: Option<String>,
 }
 
@@ -329,12 +305,9 @@ pub struct BacklogItem {
     /// Short label shown in lists. PO writes stories from this.
     pub title: String,
     /// Free-form details — context, error message, reproduction, etc.
-    #[serde(default)]
     pub details: String,
     pub source: BacklogSource,
-    #[serde(default)]
     pub category: BacklogCategory,
-    #[serde(default)]
     pub priority: BacklogPriority,
     pub status: BacklogStatus,
     pub created_at: i64,
@@ -377,7 +350,6 @@ pub struct DashboardSnapshot {
     pub iteration: Option<IterationRow>,
     pub tasks: Vec<TaskRow>,
     pub recent_events: Vec<EventRow>,
-    pub pending_steering: Option<SteeringRow>,
     pub pending_questions: Vec<QuestionRow>,
     pub preview: PreviewStatus,
     /// Non-null only when the conductor is sleeping out a rate-limit
@@ -387,7 +359,6 @@ pub struct DashboardSnapshot {
     /// Pending + currently-in-iteration backlog items for the project.
     /// Done/Dismissed items are filtered out here — UI can fetch them
     /// separately if needed.
-    #[serde(default)]
     pub backlog: Vec<BacklogItem>,
 }
 

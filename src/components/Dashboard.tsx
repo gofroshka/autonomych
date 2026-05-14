@@ -36,7 +36,7 @@ export function Dashboard({
         <Sparkles className="h-10 w-10 text-muted-foreground/30 mb-5" />
         <h2 className="text-xl font-semibold mb-2">Выбери или создай проект</h2>
         <p className="text-sm text-muted-foreground max-w-md">
-          Дай идею — Автономыч соберёт команду из ИИ-агентов и начнёт строить.
+          Опиши что строим — Автономыч соберёт команду агентов и начнёт цикл итераций.
         </p>
       </div>
     );

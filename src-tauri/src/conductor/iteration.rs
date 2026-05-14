@@ -60,11 +60,6 @@ impl Conductor {
                 None,
             );
         }
-        // Steering is *not* consumed here. `run_po_stage` reads it and marks
-        // it consumed only after the PO actually has the steering in its
-        // prompt — consuming early left the iteration with no steering at
-        // all, because `pending_steering` filters out applied rows.
-
         let project_context = snapshot_project_files(&PathBuf::from(&project.root_path)).await;
 
         let po_output = self
@@ -127,7 +122,14 @@ impl Conductor {
                 r.changelog,
                 r.risks
             ),
-            None => format!("Итерация #{}: ревью не получено", iter.number),
+            // Distinguish from a clean "iteration succeeded" so PO of the
+            // next iteration sees this in history and treats outcome as
+            // "unverified" rather than "everything's fine". The activity
+            // log also shows the ReviewerFailed event with the raw text.
+            None => format!(
+                "⚠ Итерация #{}: тема «{}» — Reviewer не дал валидного JSON-вердикта, выполнение задач не верифицировано. Беклог-айтемы возвращены в Pending для повторной проверки в следующей итерации.",
+                iter.number, po_output.iteration_theme
+            ),
         };
         // Auto-populate the backlog from this iteration's tail end:
         //   - Failed tasks → re-attempt material (one item per task, dedup by
@@ -203,18 +205,19 @@ impl Conductor {
             });
         }
 
-        // Steering rows are no longer injected directly into the PO prompt.
-        // The user-driven input flow goes entirely through the backlog now —
-        // adding an item with a category (bug/critical/feature/wish/...) and
-        // letting PO honour its own prioritisation rules ("fix bugs first").
-        // SteeringRow storage remains for backward compat with old projects
-        // but isn't consulted here anymore.
         let history = build_history_summary(&self.store, &project.id);
         let backlog = self.store.active_backlog(&project.id);
         let backlog_section = format_backlog_for_po(&backlog);
+        // No more static `project.idea` injection — that field is just a
+        // creation note now. The living source of truth is
+        // `docs/product/vision.md`, which Documenter rewrites as the
+        // project evolves and PO reads explicitly via its
+        // doc-exploration step (see system prompt). Imagine the user
+        // pivoted from "CRM for landscapers" to "scheduling SaaS" 10
+        // iterations in — the original idea would mislead PO; vision.md
+        // would reflect the truth.
         let po_prompt = format!(
-            "Идея проекта: {}\nИмя проекта: {}\n\nТекущая итерация: #{} (mode={})\n\n--- История последних итераций ---\n{}\n\n--- BACKLOG ---\n{}\n\n--- Снапшот файлов проекта ---\n{}\n\nВерни строго JSON по описанному формату.",
-            project.idea,
+            "Имя проекта: {}\n\nТекущая итерация: #{} (mode={})\n\n--- История последних итераций ---\n{}\n\n--- BACKLOG ---\n{}\n\n--- Снапшот ключевых файлов проекта ---\n{}\n\nПЕРЕД ЛЮБЫМ РЕШЕНИЕМ прочитай `docs/product/vision.md` — это актуальное видение продукта (его поддерживает Documenter). Если в проекте уже есть `docs/INDEX.md` — ходи по INDEX'ам, не читай всё подряд.\n\nВерни строго JSON по описанному формату.",
             project.name,
             iter.number,
             if mode_is_wrapup { "wrapup" } else { "normal" },
@@ -248,10 +251,9 @@ impl Conductor {
             None,
             None,
         )?;
-        // Filter PO's `picked_backlog_ids` to the set we actually showed it,
-        // then mark those rows as InIteration. Anything else is ignored —
-        // PO might hallucinate ids and we don't want to silently create
-        // orphan state.
+        // Filter PO's picks to the set we actually showed it. Anything
+        // else (PO hallucinating ids, already-closed items) is ignored to
+        // avoid silently creating orphan state.
         let valid_picks: Vec<String> = {
             let active_ids: std::collections::HashSet<&str> =
                 backlog.iter().map(|b| b.id.as_str()).collect();
@@ -442,7 +444,36 @@ impl Conductor {
             .run_json_agent(AgentRole::Reviewer, mode_is_wrapup, reviewer_prompt, project, iter)
             .await
         {
-            Ok(text) => extract_json::<ReviewerOutput>(&text).ok(),
+            Ok(text) => match extract_json::<ReviewerOutput>(&text) {
+                Ok(v) => Some(v),
+                Err(parse_err) => {
+                    // The agent ran successfully but produced unparseable
+                    // output. Without surfacing this, the iteration silently
+                    // gets `summary = "ревью не получено"` AND the backlog
+                    // items PO picked never get closed — they auto-revert
+                    // to Pending at iteration end and re-appear as Active.
+                    // Both look like ghost behaviour to the user. Log raw
+                    // text + emit a structured event so it's visible.
+                    let snippet: String = text.chars().take(800).collect();
+                    tracing::warn!(
+                        iteration = iter.number,
+                        error = %parse_err,
+                        raw = %snippet,
+                        "reviewer JSON failed to parse — full text in stderr above; backlog items will revert to Pending",
+                    );
+                    self.emit_for(
+                        EventPayload::ReviewerFailed {
+                            error: format!(
+                                "{parse_err}. Raw output (first 600 chars): {}",
+                                text.chars().take(600).collect::<String>()
+                            ),
+                        },
+                        Some(iter.id.clone()),
+                        None,
+                    );
+                    None
+                }
+            },
             Err(e) => {
                 self.emit_for(
                     EventPayload::ReviewerFailed {
@@ -455,7 +486,11 @@ impl Conductor {
             }
         };
 
-        // Apply backlog side-effects from the reviewer's verdict.
+        // Apply backlog side-effects from Reviewer's verdict. If `parsed`
+        // is None (JSON didn't parse), the ReviewerFailed event above
+        // already surfaced the raw text to the user — items will revert to
+        // Pending by the iteration finaliser and re-appear in backlog for
+        // the next round.
         if let Some(out) = parsed.as_ref() {
             let picked_ids: std::collections::HashSet<&str> = in_iteration_backlog
                 .iter()
@@ -535,7 +570,7 @@ impl Conductor {
             .unwrap_or_default();
 
         let prompt = format!(
-            "Идея проекта: {idea}\nИмя: {name}\nИтерация #{n}, тема: {theme}\nКорень: {root} — ты в нём.\n\n--- User stories этой итерации ---\n{stories}\n\n--- Задачи и их статусы ---\n{tasks}{reviewer}\n\nОбнови распределённую документацию в `docs/` по алгоритму из системного промпта. Не забудь закоммитить.",
+            "Заметка пользователя при создании проекта (МОЖЕТ БЫТЬ УСТАРЕЛОЙ, проект мог пойти в другую сторону — сверяйся с кодом и докой): {idea}\nИмя проекта: {name}\nИтерация #{n}, тема: {theme}\nКорень: {root} — ты в нём.\n\n--- User stories этой итерации ---\n{stories}\n\n--- Задачи и их статусы ---\n{tasks}{reviewer}\n\nОбнови распределённую документацию в `docs/` по алгоритму из системного промпта. Не забудь обновить `docs/product/vision.md` если видение продукта эволюционировало (новая ниша/аудитория/механика), и закоммитить.",
             idea = project.idea,
             name = project.name,
             n = iter.number,
@@ -554,7 +589,6 @@ impl Conductor {
             model: project.model_specialist.clone(),
             tools: tools_for(AgentRole::Documenter),
             permission_mode: project.permission_mode,
-            max_turns: 30,
             claude_code_preset: true,
             cancel: Some(self.cancel_token()),
             backend: project.agent_backend,
@@ -603,15 +637,6 @@ impl Conductor {
                 PermissionMode::BypassPermissions
             } else {
                 PermissionMode::AcceptEdits
-            },
-            // PO/Architect/Reviewer all need tool-using turns to explore
-            // docs and source before producing JSON. Reviewer historically
-            // needed the most (it also runs build/tests); PO/Architect now
-            // also read files, so bump them above the old 5-turn cap.
-            max_turns: match role {
-                AgentRole::Reviewer => 15,
-                AgentRole::ProductOwner | AgentRole::Architect => 12,
-                _ => 5,
             },
             // claude_code_preset must be true for any role that uses Read/
             // Glob/Grep — it pulls in Claude Code's tool-use scaffolding.

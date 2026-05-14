@@ -26,7 +26,6 @@ impl Conductor {
             prompt,
             system_prompt(AgentRole::Presenter, false, false).to_string(),
             tools_for(AgentRole::Presenter),
-            40,
         );
         let publisher = self.event_publisher();
         let iter_id = iter.as_ref().map(|i| i.id.clone());
@@ -73,7 +72,6 @@ impl Conductor {
             prompt,
             system_prompt(AgentRole::Presenter, false, true).to_string(),
             vec!["Read".into(), "Bash".into()],
-            10,
         );
         let publisher = self.event_publisher();
         let res = run_agent(inv, move |ev| {
@@ -157,7 +155,6 @@ impl Conductor {
             model: project.model_specialist.clone(),
             tools: tools_for(AgentRole::Presenter),
             permission_mode: project.permission_mode,
-            max_turns: 20,
             claude_code_preset: true,
             cancel: Some(self.cancel_token()),
             backend: project.agent_backend,
@@ -183,7 +180,6 @@ impl Conductor {
         user_prompt: String,
         system_prompt: String,
         tools: Vec<String>,
-        max_turns: u32,
     ) -> AgentInvocation {
         AgentInvocation {
             role: AgentRole::Presenter,
@@ -193,7 +189,6 @@ impl Conductor {
             model: project.model_specialist.clone(),
             tools,
             permission_mode: project.permission_mode,
-            max_turns,
             claude_code_preset: true,
             cancel: Some(self.cancel_token()),
             backend: project.agent_backend,

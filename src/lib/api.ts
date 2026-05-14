@@ -54,13 +54,10 @@ export const api = {
     invoke<void>("stop_conductor", { projectId }),
   requestWrapUp: (projectId: string) =>
     invoke<void>("request_wrap_up", { projectId }),
-  /** Queue steering for the next iteration without waking a parked
-   *  conductor. Use this from Idle/Error states — `resume` is only for
-   *  the Presenting state. */
-  pushSteering: (projectId: string, message: string, mode: "soft" | "override") =>
-    invoke<void>("push_steering", { projectId, message, mode }),
-  resume: (projectId: string, message: string, mode: "soft" | "override") =>
-    invoke<void>("resume", { projectId, message, mode }),
+  /** Wake the conductor from Presenting state and fall into the next
+   *  iteration. User input goes through the backlog now, so this carries
+   *  no payload. */
+  resume: (projectId: string) => invoke<void>("resume", { projectId }),
   stopPreview: (projectId: string) =>
     invoke<void>("stop_preview", { projectId }),
   retryPreview: (projectId: string) =>

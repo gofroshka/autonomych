@@ -39,7 +39,7 @@ export function IterationHeader({
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-0.5">
             <h1 className="text-base font-semibold truncate">{project.name}</h1>
-            <Button variant="ghost" size="icon" className="h-6 w-6" onClick={onEditProject} disabled={isRunning} title={isRunning ? "Останови цикл, чтобы редактировать" : "Изменить идею"}>
+            <Button variant="ghost" size="icon" className="h-6 w-6" onClick={onEditProject} disabled={isRunning} title={isRunning ? "Останови цикл, чтобы редактировать" : "Изменить имя и описание"}>
               {isRunning ? <Lock className="h-3 w-3" /> : <Pencil className="h-3 w-3" />}
             </Button>
             <Button variant="ghost" size="icon" className="h-6 w-6" onClick={onSettings} disabled={isRunning} title={isRunning ? "Останови цикл, чтобы менять CLI и модели" : "CLI и модели"}>

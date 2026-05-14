@@ -16,7 +16,6 @@ import type {
   DashboardSnapshot,
   EventRow,
   ProjectRow,
-  SteeringMode,
 } from "../types";
 
 /** Max events we keep in memory before dropping oldest. */
@@ -48,7 +47,7 @@ export interface AppState {
   startPresentation: () => Promise<void>;
   stop: () => Promise<void>;
   wrapUp: () => Promise<void>;
-  resume: (message: string, mode: SteeringMode) => Promise<void>;
+  resume: () => Promise<void>;
   answerQuestion: (questionId: string, answer: string) => Promise<void>;
 }
 
@@ -185,14 +184,11 @@ export function useApp(): AppState {
   const wrapUp = useCallback(async () => {
     if (activeId) await api.requestWrapUp(activeId);
   }, [activeId]);
-  const resume = useCallback(
-    async (message: string, mode: SteeringMode) => {
-      if (!activeId) return;
-      await api.resume(activeId, message, mode);
-      await refreshSnapshot(activeId);
-    },
-    [activeId, refreshSnapshot]
-  );
+  const resume = useCallback(async () => {
+    if (!activeId) return;
+    await api.resume(activeId);
+    await refreshSnapshot(activeId);
+  }, [activeId, refreshSnapshot]);
   const answerQuestion = useCallback(
     async (questionId: string, answer: string) => {
       await api.answerQuestion(questionId, answer);

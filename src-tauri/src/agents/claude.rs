@@ -165,10 +165,8 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // `claude` CLI has no explicit `--max-turns`. Agents are expected to
-    // self-terminate per their system prompts; a long-running specialist is
-    // legitimate, so we don't bound runtime here.
-    let _ = inv.max_turns;
+    // Agents self-terminate per their system prompts; we never bound run
+    // time at the CLI level. Codex has no equivalent flag either.
 
     let mut child: Child = cmd
         .spawn()

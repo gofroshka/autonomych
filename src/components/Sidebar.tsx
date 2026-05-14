@@ -144,7 +144,7 @@ function ProjectItem({
             disabled={running}
             onClick={() => { setMenuOpen(false); onRename(); }}
           >
-            {running ? "Изменить идею (после стопа)" : "Изменить идею"}
+            {running ? "Редактировать (после стопа)" : "Редактировать"}
           </MenuItem>
           <MenuItem
             icon={<Settings className="h-3.5 w-3.5" />}

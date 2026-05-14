@@ -5,9 +5,9 @@
 //!   <data>/projects.json     — `[ProjectRow, ...]`
 //!   <data>/iterations.json   — `[IterationRow, ...]`
 //!   <data>/tasks.json
-//!   <data>/steering.json
 //!   <data>/questions.json
 //!   <data>/chat.json
+//!   <data>/backlog.json
 //!   <data>/events/<project_id>.jsonl  — append-only event log
 
 use crate::error::{AppError, AppResult};
@@ -35,7 +35,6 @@ struct Inner {
     projects: HashMap<String, ProjectRow>,
     iterations: HashMap<String, IterationRow>,
     tasks: HashMap<String, TaskRow>,
-    steering: HashMap<String, SteeringRow>,
     questions: HashMap<String, QuestionRow>,
     chat: HashMap<String, ChatMessageRow>,
     backlog: HashMap<String, BacklogItem>,
@@ -99,7 +98,6 @@ impl Store {
         let iterations =
             load_collection(&data_dir.join("iterations.json"), |i: &IterationRow| &i.id);
         let tasks = load_collection(&data_dir.join("tasks.json"), |t: &TaskRow| &t.id);
-        let steering = load_collection(&data_dir.join("steering.json"), |s: &SteeringRow| &s.id);
         let questions =
             load_collection(&data_dir.join("questions.json"), |q: &QuestionRow| &q.id);
         let chat = load_collection(&data_dir.join("chat.json"), |c: &ChatMessageRow| &c.id);
@@ -111,7 +109,6 @@ impl Store {
                 projects,
                 iterations,
                 tasks,
-                steering,
                 questions,
                 chat,
                 backlog,
@@ -222,7 +219,6 @@ impl Store {
                 .collect();
             g.iterations.retain(|_, i| i.project_id != id);
             g.tasks.retain(|_, t| !removed_iters.contains(&t.iteration_id));
-            g.steering.retain(|_, s| s.project_id != id);
             g.questions.retain(|_, q| q.project_id != id);
             g.chat.retain(|_, c| c.project_id != id);
             g.backlog.retain(|_, b| b.project_id != id);
@@ -577,52 +573,6 @@ impl Store {
             .join(format!("{project_id}.jsonl"))
     }
 
-    // ---- Steering ----
-    pub fn push_steering(
-        &self,
-        project_id: &str,
-        message: &str,
-        mode: SteeringMode,
-    ) -> AppResult<SteeringRow> {
-        let row = SteeringRow {
-            id: nano(10),
-            project_id: project_id.to_string(),
-            message: message.to_string(),
-            mode,
-            applied_iteration_id: None,
-            ts: now_ms(),
-        };
-        self.inner
-            .write_or_poisoned()
-            .steering
-            .insert(row.id.clone(), row.clone());
-        self.flush_steering()?;
-        Ok(row)
-    }
-
-    pub fn pending_steering(&self, project_id: &str) -> Option<SteeringRow> {
-        self.inner
-            .read_or_poisoned()
-            .steering
-            .values()
-            .filter(|s| s.project_id == project_id && s.applied_iteration_id.is_none())
-            .max_by_key(|s| s.ts)
-            .cloned()
-    }
-
-    /// Kept for backward compatibility with existing `steering.json` files.
-    /// As of the category-based backlog rollout the conductor no longer
-    /// injects steering rows into the PO prompt — all user input flows
-    /// through the backlog instead. This method may go away once we drop
-    /// the SteeringRow storage entirely.
-    #[allow(dead_code)]
-    pub fn consume_steering(&self, id: &str, iteration_id: &str) -> AppResult<()> {
-        if let Some(s) = self.inner.write_or_poisoned().steering.get_mut(id) {
-            s.applied_iteration_id = Some(iteration_id.to_string());
-        }
-        self.flush_steering()
-    }
-
     // ---- Questions ----
     pub fn push_question(
         &self,
@@ -951,7 +901,6 @@ impl Store {
         self.flush_projects()?;
         self.flush_iterations()?;
         self.flush_tasks()?;
-        self.flush_steering()?;
         self.flush_questions()?;
         self.flush_chat()?;
         self.flush_backlog()
@@ -971,11 +920,6 @@ impl Store {
         let g = self.inner.read_or_poisoned();
         let vec: Vec<&TaskRow> = g.tasks.values().collect();
         write_json_atomic(&self.data_dir.join("tasks.json"), &vec)
-    }
-    fn flush_steering(&self) -> AppResult<()> {
-        let g = self.inner.read_or_poisoned();
-        let vec: Vec<&SteeringRow> = g.steering.values().collect();
-        write_json_atomic(&self.data_dir.join("steering.json"), &vec)
     }
     fn flush_questions(&self) -> AppResult<()> {
         let g = self.inner.read_or_poisoned();
@@ -1051,7 +995,6 @@ mod tests {
                 vec![],
             )
             .expect("task");
-        s.push_steering(&p.id, "msg", SteeringMode::Soft).unwrap();
         s.push_question(&p.id, Some(it.id.clone()), Some(t.id.clone()), None, "?".into(), "ctx".into())
             .unwrap();
         s.push_chat(&p.id, ChatRole::User, "hi".into(), None).unwrap();
@@ -1061,7 +1004,6 @@ mod tests {
         assert!(s.get_project(&p.id).is_none());
         assert!(s.iterations_by_project(&p.id).is_empty());
         assert!(s.iteration_tasks(&it.id).is_empty());
-        assert!(s.pending_steering(&p.id).is_none());
         assert!(s.pending_questions(&p.id).is_empty());
         assert!(s.chat_history(&p.id).is_empty());
     }
@@ -1104,18 +1046,4 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn pending_steering_returns_latest_unapplied() {
-        let (s, _t) = store();
-        let p = create(&s, "p");
-        let _first = s.push_steering(&p.id, "first", SteeringMode::Soft).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let second = s.push_steering(&p.id, "second", SteeringMode::Soft).unwrap();
-        assert_eq!(s.pending_steering(&p.id).map(|s| s.id), Some(second.id.clone()));
-        let it = s.create_iteration(&p.id).unwrap();
-        s.consume_steering(&second.id, &it.id).unwrap();
-        // after consuming, falls back to `first` which is older but still pending
-        let next = s.pending_steering(&p.id).unwrap();
-        assert_eq!(next.message, "first");
-    }
 }

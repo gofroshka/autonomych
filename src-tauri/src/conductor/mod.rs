@@ -99,12 +99,14 @@ impl Conductor {
     #[tracing::instrument(skip(self), fields(project_id = %self.project_id))]
     pub async fn start(self: Arc<Self>) -> AppResult<()> {
         let project = self.project_snapshot();
-        crate::git::ensure_repo(
-            &PathBuf::from(&project.root_path),
-            &project.name,
-            &project.idea,
-        )
-        .await?;
+        let root = PathBuf::from(&project.root_path);
+        crate::git::ensure_repo(&root, &project.name, &project.idea).await?;
+        // Seed (idempotent) docs/INDEX.md, docs/product/INDEX.md and
+        // docs/product/vision.md. The user's idea-at-creation lives in
+        // vision.md, where Documenter can rewrite it as the project
+        // evolves. PO/Architect read this file via their existing
+        // doc-exploration loop — no static idea field is injected.
+        crate::git::ensure_initial_docs(&root, &project.name, &project.idea).await?;
 
         let resumable = self.store.find_resumable_iteration(&project.id);
         self.reset_cancel();
@@ -132,12 +134,9 @@ impl Conductor {
     #[tracing::instrument(skip(self), fields(project_id = %self.project_id))]
     pub async fn start_presentation_only(self: Arc<Self>) -> AppResult<()> {
         let project = self.project_snapshot();
-        crate::git::ensure_repo(
-            &PathBuf::from(&project.root_path),
-            &project.name,
-            &project.idea,
-        )
-        .await?;
+        let root = PathBuf::from(&project.root_path);
+        crate::git::ensure_repo(&root, &project.name, &project.idea).await?;
+        crate::git::ensure_initial_docs(&root, &project.name, &project.idea).await?;
         self.reset_cancel();
 
         let resumable = self.store.find_resumable_iteration(&project.id);

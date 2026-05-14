@@ -152,7 +152,6 @@ pub async fn get_snapshot(
         .as_ref()
         .map(|p| state.store.recent_events(&p.id, 100, 0))
         .unwrap_or_default();
-    let pending_steering = project.as_ref().and_then(|p| state.store.pending_steering(&p.id));
     let pending_questions = project
         .as_ref()
         .map(|p| state.store.pending_questions(&p.id))
@@ -180,7 +179,6 @@ pub async fn get_snapshot(
         iteration,
         tasks,
         recent_events,
-        pending_steering,
         pending_questions,
         preview,
         cooldown,
@@ -243,46 +241,11 @@ pub async fn request_wrap_up(
     Ok(())
 }
 
-/// Queue a steering message for the next iteration's PO without waking any
-/// parked conductor. Used from the dashboard when the user wants to give
-/// initial direction *before* pressing Start, or in the Idle state more
-/// generally. `resume` also pushes steering as a side-effect, but it
-/// additionally fires the resume waker — which is wrong when we're not
-/// already in Presenting.
+/// Wake the conductor from Presenting state so it falls into the next
+/// iteration. User-side direction goes through the backlog now; this
+/// command carries no payload.
 #[tauri::command]
-pub async fn push_steering(
-    state: State<'_, AppState>,
-    project_id: String,
-    message: String,
-    mode: String,
-) -> AppResult<()> {
-    let trimmed = message.trim();
-    if trimmed.is_empty() {
-        return Ok(());
-    }
-    let m = match mode.as_str() {
-        "override" => SteeringMode::Override,
-        _ => SteeringMode::Soft,
-    };
-    state.store.push_steering(&project_id, trimmed, m)?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn resume(
-    state: State<'_, AppState>,
-    project_id: String,
-    message: String,
-    mode: String,
-) -> AppResult<()> {
-    let trimmed = message.trim();
-    if !trimmed.is_empty() {
-        let m = match mode.as_str() {
-            "override" => SteeringMode::Override,
-            _ => SteeringMode::Soft,
-        };
-        let _ = state.store.push_steering(&project_id, trimmed, m);
-    }
+pub async fn resume(state: State<'_, AppState>, project_id: String) -> AppResult<()> {
     if let Some(c) = state.conductors.lock().await.get(&project_id).cloned() {
         c.resume().await;
     }
@@ -422,7 +385,6 @@ pub async fn send_chat_message(
         model: project.model_pm.clone(),
         tools: crate::agents::tools_for(AgentRole::Overseer),
         permission_mode: PermissionMode::AcceptEdits,
-        max_turns: 8,
         claude_code_preset: true,
         cancel: None,
         backend: project.agent_backend,

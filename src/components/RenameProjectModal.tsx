@@ -24,7 +24,9 @@ export function RenameProjectModal({
         <DialogHeader>
           <DialogTitle>Редактировать проект</DialogTitle>
           <DialogDescription>
-            {isRunning ? "Цикл сейчас работает — редактирование заблокировано." : "Изменения применятся к следующей итерации PO."}
+            {isRunning
+              ? "Цикл сейчас работает — редактирование заблокировано."
+              : "Это только UI-описание для сайдбара. Чтобы реально поменять направление проекта — отредактируй docs/product/vision.md (или дай айтем в беклог с категорией critical)."}
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
@@ -33,8 +35,8 @@ export function RenameProjectModal({
             <Input value={name} onChange={(e) => setName(e.target.value)} disabled={isRunning} autoFocus />
           </div>
           <div className="space-y-1.5">
-            <Label>Идея</Label>
-            <Textarea value={idea} onChange={(e) => setIdea(e.target.value)} rows={7} disabled={isRunning} />
+            <Label>Описание (для сайдбара)</Label>
+            <Textarea value={idea} onChange={(e) => setIdea(e.target.value)} rows={4} disabled={isRunning} />
           </div>
         </div>
         <DialogFooter>

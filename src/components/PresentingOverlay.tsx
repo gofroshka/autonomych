@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import type { BacklogCategory, BacklogPriority, DashboardSnapshot, ProjectRow, SteeringMode } from "../types";
+import type { BacklogCategory, BacklogPriority, DashboardSnapshot, ProjectRow } from "../types";
 import { CategorySelector } from "./BacklogPanel";
 import { api } from "../lib/api";
 import { Badge } from "./ui/badge";
@@ -36,7 +36,8 @@ interface PresenterTurn {
 interface Props {
   project: ProjectRow;
   snapshot: DashboardSnapshot | null;
-  onResume: (msg: string, mode: SteeringMode) => void;
+  /** Wake the conductor from Presenting → next iteration starts. */
+  onResume: () => void;
   /** Fires after the user adds something to the backlog from this overlay,
    *  so the parent can refresh the snapshot and update the right-panel
    *  badge count. */
@@ -357,7 +358,7 @@ export function PresentingOverlay({ project, snapshot, onResume, onBacklogChange
                 </span>
               )}
             </div>
-            <Button onClick={() => onResume("", "soft")} disabled={isPreparing}>
+            <Button onClick={onResume} disabled={isPreparing}>
               Продолжаем
             </Button>
           </div>

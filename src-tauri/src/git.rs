@@ -57,6 +57,78 @@ pub async fn ensure_repo(root: &Path, name: &str, idea: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// Seed the distributed-docs layout that PO/Architect/Documenter expect.
+/// Idempotent — only creates files that don't yet exist, so re-running
+/// against an active project never overwrites the Documenter's evolved
+/// content.
+///
+/// The "idea" the user typed at project creation lands in
+/// `docs/product/vision.md` as the FIRST iteration of the living vision.
+/// Subsequent iterations: Documenter rewrites this file as the project
+/// pivots, and PO/Architect read the up-to-date version from disk.
+/// No static `project.idea` string is injected into agent prompts — the
+/// doc is the source of truth.
+pub async fn ensure_initial_docs(root: &Path, name: &str, idea: &str) -> AppResult<()> {
+    let docs = root.join("docs");
+    let product = docs.join("product");
+    fs::create_dir_all(&product).await?;
+
+    let root_index = docs.join("INDEX.md");
+    if !root_index.exists() {
+        fs::write(
+            &root_index,
+            "# Documentation index\n\n\
+             - [product/](product/) — что мы строим и почему (vision, фичи)\n\
+             - [tech/](tech/) — стек, архитектура, конвенции (появится по мере итераций)\n\
+             - [decisions/](decisions/) — записи архитектурных решений (когда появятся)\n\
+             \n\
+             _Documenter-агент поддерживает этот файл и тематические INDEX'ы\n\
+             по областям актуальными после каждой итерации._\n",
+        )
+        .await?;
+    }
+
+    let product_index = product.join("INDEX.md");
+    if !product_index.exists() {
+        fs::write(
+            &product_index,
+            "# Product docs\n\n\
+             - [vision.md](vision.md) — что мы строим и зачем\n\
+             - features.md — реализованные фичи (Documenter создаст когда появится что описывать)\n",
+        )
+        .await?;
+    }
+
+    let vision = product.join("vision.md");
+    if !vision.exists() {
+        let body = if idea.trim().is_empty() {
+            format!(
+                "# Vision — {name}\n\n\
+                 _Пользователь не оставил заметки при создании. PO определит видение исходя из имени проекта и контекста._\n\n\
+                 ---\n\n\
+                 _Этот файл — \"что мы строим и почему\". Documenter обновляет его \
+                 по мере развития проекта; PO и Architect читают его как источник истины.\
+                 Если направление проекта изменилось — обнови этот файл._\n",
+                name = name
+            )
+        } else {
+            format!(
+                "# Vision — {name}\n\n\
+                 {idea}\n\n\
+                 ---\n\n\
+                 _Это заметка пользователя на момент создания проекта. \
+                 Documenter обновляет этот файл по мере развития проекта — \
+                 PO и Architect читают его как источник истины о текущем видении. \
+                 Если направление поменялось, отрази это здесь._\n",
+                name = name,
+                idea = idea.trim()
+            )
+        };
+        fs::write(&vision, body).await?;
+    }
+    Ok(())
+}
+
 pub async fn create_worktree(root: &Path, branch: &str, worktree_path: &Path) -> AppResult<()> {
     let branches = git(root, &["branch", "--list"]).await.unwrap_or_default();
     let wt_str = worktree_path.to_string_lossy().into_owned();

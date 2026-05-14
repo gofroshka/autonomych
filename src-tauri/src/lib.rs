@@ -107,7 +107,6 @@ pub fn run() {
             ipc::start_presentation_only,
             ipc::stop_conductor,
             ipc::request_wrap_up,
-            ipc::push_steering,
             ipc::resume,
             ipc::stop_preview,
             ipc::retry_preview,

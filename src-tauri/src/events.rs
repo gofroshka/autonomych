@@ -168,13 +168,6 @@ pub enum EventPayload {
     },
 
     // ---- Loop / runtime errors ----
-    Backoff {
-        duration_ms: u64,
-        consecutive: usize,
-    },
-    TooManyFailures {
-        consecutive: usize,
-    },
     LoopError {
         error: String,
     },

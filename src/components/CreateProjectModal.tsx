@@ -43,7 +43,7 @@ export function CreateProjectModal({ onClose, onCreate }: Props) {
       <DialogContent className="max-w-xl">
         <DialogHeader>
           <DialogTitle>Новый проект</DialogTitle>
-          <DialogDescription>Дай имя и опиши идею. Автономыч поднимет команду агентов и начнёт цикл разработки.</DialogDescription>
+          <DialogDescription>Дай имя и опиши что хочешь построить — Автономыч соберёт команду агентов и начнёт цикл разработки.</DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
           <div className="space-y-1.5">
@@ -51,9 +51,13 @@ export function CreateProjectModal({ onClose, onCreate }: Props) {
             <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="eco-portal" autoFocus />
           </div>
           <div className="space-y-1.5">
-            <Label>Идея</Label>
+            <Label>Видение продукта</Label>
             <Textarea value={idea} onChange={(e) => setIdea(e.target.value)} rows={5}
               placeholder="Корпоративный портал для компаний, занимающихся экологией..." />
+            <p className="text-[11px] text-muted-foreground/80 leading-relaxed">
+              Уйдёт в <code className="text-[10px]">docs/product/vision.md</code> — это источник истины для PO и Architect.
+              Documenter будет обновлять файл по мере того, как проект эволюционирует, так что описание само догоняет реальность.
+            </p>
           </div>
           <div className="space-y-1.5">
             <Label>Папка проекта</Label>

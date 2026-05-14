@@ -41,7 +41,6 @@ pub struct AgentInvocation {
     /// which surfaces tools through its own sandbox & MCP config.
     pub tools: Vec<String>,
     pub permission_mode: PermissionMode,
-    pub max_turns: u32,
     /// Claude-specific: append vs replace the system prompt preset.
     /// Ignored by Codex.
     pub claude_code_preset: bool,

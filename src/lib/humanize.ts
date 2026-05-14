@@ -214,7 +214,16 @@ export function humanize(ev: EventRow): HumanEvent | null {
     case "arch_skipped_resume":
       return { ...base, role: "architect", kind: "info", action: `Задачи уже есть (${p.tasks})` };
     case "reviewer_failed":
-      return { ...base, role: "reviewer", kind: "error", action: "Ревью не получено", target: p.error.slice(0, 200) };
+      // Covers both "agent crashed" and "agent ran but JSON didn't parse".
+      // The error string contains a snippet of raw text when it's a parse
+      // failure — show more of it so the user can see what went wrong.
+      return {
+        ...base,
+        role: "reviewer",
+        kind: "error",
+        action: "Ревью не зачтено (см. детали)",
+        target: p.error.slice(0, 400),
+      };
     case "resume_iteration":
       return {
         ...base,
@@ -275,20 +284,6 @@ export function humanize(ev: EventRow): HumanEvent | null {
       return null;
 
     // ---- Loop errors ----
-    case "backoff":
-      return {
-        ...base,
-        role: null,
-        kind: "info",
-        action: `Пауза ${(p.duration_ms / 1000).toFixed(1)}с после ${p.consecutive} падений`,
-      };
-    case "too_many_failures":
-      return {
-        ...base,
-        role: null,
-        kind: "error",
-        action: `${p.consecutive} падений подряд — стоп`,
-      };
     case "loop_error":
       return { ...base, role: null, kind: "error", action: "Сбой цикла", target: p.error.slice(0, 200) };
 

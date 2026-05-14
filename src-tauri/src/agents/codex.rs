@@ -205,7 +205,8 @@ where
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let _ = inv.max_turns;
+    // Codex doesn't honour Claude's tool gating / preset flag; the agent's
+    // sandbox handles permissions instead. Suppress unused-field warnings.
     let _ = &inv.tools;
     let _ = inv.claude_code_preset;
 
@@ -477,7 +478,6 @@ mod tests {
             model: "gpt-5-codex".into(),
             tools: vec![],
             permission_mode: PermissionMode::Default,
-            max_turns: 5,
             claude_code_preset: false,
             cancel: None,
             backend: crate::types::AgentBackend::Codex,

@@ -13,7 +13,9 @@ pub(super) struct PoOutput {
     #[serde(default)]
     pub stories: Vec<IterationStory>,
     /// IDs of backlog items PO is addressing this iteration. The conductor
-    /// flips those rows to InIteration after parsing this output.
+    /// flips those rows to InIteration after parsing this output. Invalid
+    /// or unknown ids are ignored — PO might hallucinate, we don't want
+    /// orphan state.
     #[serde(default)]
     pub picked_backlog_ids: Vec<String>,
     /// New items PO wants to park for later iterations (not picked now).
@@ -84,4 +86,3 @@ pub(super) struct ReviewerBacklogProposal {
 fn default_reviewer_category() -> BacklogCategory {
     BacklogCategory::Bug
 }
-

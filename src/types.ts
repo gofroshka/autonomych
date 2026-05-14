@@ -167,8 +167,6 @@ export type EventPayload =
   | { type: "preview_shutdown_done" }
   | { type: "preview_shutdown_skipped"; reason: string }
   // Loop / runtime errors
-  | { type: "backoff"; duration_ms: number; consecutive: number }
-  | { type: "too_many_failures"; consecutive: number }
   | { type: "loop_error"; error: string }
   // Provider rate-limit cooldown
   | { type: "cooldown_started"; retry_at_ms: number; reason: string }
@@ -184,17 +182,6 @@ export interface EventRow {
   task_id: string | null;
   agent_role: AgentRole | null;
   payload: EventPayload;
-  ts: number;
-}
-
-export type SteeringMode = "soft" | "override";
-
-export interface SteeringRow {
-  id: string;
-  project_id: string;
-  message: string;
-  mode: SteeringMode;
-  applied_iteration_id: string | null;
   ts: number;
 }
 
@@ -283,13 +270,12 @@ export interface DashboardSnapshot {
   iteration: IterationRow | null;
   tasks: TaskRow[];
   recent_events: EventRow[];
-  pending_steering: SteeringRow | null;
   pending_questions: QuestionRow[];
   preview: PreviewStatus;
   /** Non-null while the conductor is sleeping out a rate-limit cooldown. */
-  cooldown?: CooldownInfo | null;
+  cooldown: CooldownInfo | null;
   /** Pending + currently-in-iteration backlog items for the project. */
-  backlog?: BacklogItem[];
+  backlog: BacklogItem[];
 }
 
 export interface CreateProjectInput {
